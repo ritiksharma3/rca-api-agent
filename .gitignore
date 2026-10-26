@@ -1,0 +1,16 @@
+.venv/
+venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+node_modules/
+node_tools/
+# generated output
+artifacts/*
+!artifacts/.gitkeep
+# secrets / local config
+.env
+*.secret
+credentials*.json
+*.log
+.api-agent-tmp/

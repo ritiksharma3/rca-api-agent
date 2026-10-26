@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>API QA report</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#1c2230; --mute:#5d677a; --line:#e2e6ee;
+          --pass:#17803d; --fail:#b42318; --block:#a15c07; --nd:#5b3fb5; --accent:#2457d6; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  main { max-width:1100px; margin:0 auto; padding:24px 16px 64px; }
+  h1 { font-size:22px; margin:0 0 4px; } h2 { font-size:16px; margin:32px 0 10px; }
+  .sub { color:var(--mute); margin-bottom:20px; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:12px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:12px 14px; }
+  .card b { display:block; font-size:26px; line-height:1.1; }
+  .card span { color:var(--mute); font-size:12px; }
+  .PASS b,.s-PASS { color:var(--pass); } .FAIL b,.s-FAIL { color:var(--fail); }
+  .BLOCKED b,.s-BLOCKED { color:var(--block); } .ND b,.s-ND { color:var(--nd); }
+  table { width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+  th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { background:#eef1f6; font-size:12px; text-transform:uppercase; letter-spacing:.03em; color:var(--mute); }
+  tr:last-child td { border-bottom:0; }
+  .tag { display:inline-block; font-weight:600; font-size:12px; padding:1px 8px; border-radius:99px; border:1px solid currentColor; }
+  code, .mono { font-family:ui-monospace,Consolas,monospace; font-size:12.5px; }
+  .method { font-weight:700; }
+  .notice { background:#fff8e6; border:1px solid #f0d58a; border-radius:8px; padding:10px 14px; margin:10px 0; }
+  .err { background:#fdecea; border:1px solid #f1b5ae; }
+  details { margin:4px 0; } summary { cursor:pointer; color:var(--accent); }
+  ul { margin:6px 0; padding-left:20px; }
+  .wrap { overflow-x:auto; }
+  .muted { color:var(--mute); }
+  @media (max-width:640px){ th:nth-child(4),td:nth-child(4){display:none;} }
+</style>
+</head>
+<body>
+<main>
+  <h1>API QA report</h1>
+  <div class="sub">
+    Generated {{ r.generated_at }} · framework {{ r.project.framework or 'unknown' }} ·
+    discovery: {{ r.discovery.strategy_used or 'none' }} ·
+    target: {{ r.target.get('base_url') or 'not tested' }}
+  </div>
+
+  {% if r.blockers %}
+  <div class="notice err"><b>Blockers</b><ul>{% for b in r.blockers %}<li>{{ b }}</li>{% endfor %}</ul></div>
+  {% endif %}
+  <div class="notice">{{ r.coverage.disclaimer }}
+    Discovery {% if r.coverage.discovery_complete %}is backed by the framework's own route registry.{% else %}cannot prove completeness; the endpoint count is a lower bound.{% endif %}</div>
+
+  <div class="cards">
+    <div class="card PASS"><b>{{ r.status_counts['PASS'] }}</b><span>PASS (endpoints)</span></div>
+    <div class="card FAIL"><b>{{ r.status_counts['FAIL'] }}</b><span>FAIL (endpoints)</span></div>
+    <div class="card BLOCKED"><b>{{ r.status_counts['BLOCKED'] }}</b><span>BLOCKED (endpoints)</span></div>
+    <div class="card ND"><b>{{ r.status_counts['NOT DISCOVERED'] }}</b><span>NOT DISCOVERED (potential routes)</span></div>
+    <div class="card"><b>{{ r.coverage.confirmed_routes }}</b><span>confirmed routes discovered</span></div>
+    <div class="card"><b>{{ r.execution.requests_executed }}</b><span>requests executed / {{ r.execution.planned_requests }} planned</span></div>
+    <div class="card"><b>{{ r.execution.assertions }}</b><span>assertions ({{ r.execution.failed_assertions }} failed, {{ r.execution.skipped_tests }} skipped)</span></div>
+  </div>
+
+  <h2>Endpoints</h2>
+  <div class="wrap"><table>
+    <tr><th>Test status</th><th>Endpoint</th><th>Discovery</th><th>Source</th><th>Details</th></tr>
+    {% for v in r.endpoints %}
+    <tr>
+      <td><span class="tag s-{{ 'ND' if v.test_status == 'NOT DISCOVERED' else v.test_status }}">{{ v.test_status }}</span></td>
+      <td><span class="method">{{ v.method }}</span> <code>{{ v.route }}</code></td>
+      <td>{{ v.discovery_status }}<br><span class="muted">{{ v.discovery_strategy }}, {{ v.confidence }} confidence</span></td>
+      <td class="mono">{{ v.source or '' }}</td>
+      <td>
+        {% if v.reason %}<div>{{ v.reason }}</div>{% endif %}
+        <details><summary>{{ v.scenarios|length }} scenario(s)</summary>
+          <ul>
+          {% for s in v.scenarios %}
+            <li><span class="tag s-{{ s.status }}">{{ s.status }}</span> <b>{{ s.scenario }}</b>
+              {% if s.executed %} · HTTP {{ s.http_status }} in {{ s.duration_ms }} ms · {{ s.timestamp }}{% endif %}
+              {% if s.expected_statuses or s.expected_basis %}<br><span class="muted">expected: {{ s.expected_statuses or 'any in documented range' }} ({{ s.expected_basis }})</span>{% endif %}
+              {% if s.reason %}<br>{{ s.reason }}{% endif %}
+              {% if s.evidence.get('response_body_snippet') %}<br><code>{{ s.evidence['response_body_snippet'] }}</code>{% endif %}
+            </li>
+          {% endfor %}
+          </ul>
+        </details>
+      </td>
+    </tr>
+    {% endfor %}
+  </table></div>
+
+  {% if r.potential_routes %}
+  <h2>Potential routes — NOT DISCOVERED</h2>
+  <p class="muted">Seen in source analysis but not resolved to a concrete method and path. They were not tested.</p>
+  <div class="wrap"><table><tr><th>Description</th><th>Why unresolved</th><th>Location</th></tr>
+    {% for p in r.potential_routes %}<tr><td><code>{{ p.description }}</code></td><td>{{ p.reason }}</td><td class="mono">{{ p.source_file }}:{{ p.line }}</td></tr>{% endfor %}
+  </table></div>
+  {% endif %}
+
+  {% if r.discrepancies %}
+  <h2>Discovery discrepancies</h2>
+  <div class="wrap"><table><tr><th>Kind</th><th>Route</th><th>Detail</th></tr>
+    {% for d in r.discrepancies %}<tr><td>{{ d.kind }}</td><td><b>{{ d.method }}</b> <code>{{ d.route }}</code></td><td>{{ d.detail }}</td></tr>{% endfor %}
+  </table></div>
+  {% endif %}
+
+  <h2>Discovery</h2>
+  <table><tr><th>Adapter</th><th>Outcome</th><th>Detail</th></tr>
+    {% for a in r.discovery.attempts %}<tr><td>{{ a.adapter }}</td><td>{{ a.outcome }}{% if a.endpoint_count %} ({{ a.endpoint_count }}){% endif %}</td><td>{{ a.detail }}</td></tr>{% endfor %}
+  </table>
+  <h2>Endpoints by method</h2>
+  <p>{% for m, n in r.coverage.by_method.items() %}<span class="tag">{{ m }} {{ n }}</span> {% endfor %}</p>
+  <h2>Limitations and coverage gaps</h2>
+  <ul>{% for l in r.discovery.limitations %}<li>{{ l }}</li>{% endfor %}</ul>
+  {% if r.discovery.warnings %}<h2>Discovery warnings</h2>
+  <ul>{% for w in r.discovery.warnings %}<li>[{{ w.adapter }}] {{ w.message }}{% if w.source_file %} <span class="mono">({{ w.source_file }}{% if w.line %}:{{ w.line }}{% endif %})</span>{% endif %}</li>{% endfor %}</ul>{% endif %}
+
+  <h2>Needs manual review</h2>
+  {% if r.manual_review %}<ul>{% for m in r.manual_review %}<li>{{ m }}</li>{% endfor %}</ul>{% else %}<p class="muted">Nothing flagged.</p>{% endif %}
+
+  <h2>Environment and policy</h2>
+  <table>
+    <tr><th>Tool versions</th><td class="mono">{% for k, v in r.tool_versions.items() %}{{ k }}={{ v or 'not found' }} {% endfor %}</td></tr>
+    <tr><th>Target</th><td class="mono">{{ r.target }}</td></tr>
+    <tr><th>Policy</th><td class="mono">{{ r.policy }}</td></tr>
+  </table>
+  <h2>Notes</h2>
+  <ul>{% for n in r.notes %}<li>{{ n }}</li>{% endfor %}</ul>
+  {% if r.execution.log_excerpt %}<details><summary>Sanitized Newman log excerpt</summary><pre class="mono">{{ r.execution.log_excerpt }}</pre></details>{% endif %}
+</main>
+</body>
+</html>
