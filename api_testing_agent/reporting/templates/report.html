@@ -116,6 +116,16 @@
   <h2>Needs manual review</h2>
   {% if r.manual_review %}<ul>{% for m in r.manual_review %}<li>{{ m }}</li>{% endfor %}</ul>{% else %}<p class="muted">Nothing flagged.</p>{% endif %}
 
+  {% if r.authentication and r.authentication.method != 'none' %}
+  <h2>Authentication</h2>
+  <table>
+    <tr><th>Method</th><td>{{ r.authentication.method }} ({{ 'credentials obtained' if r.authentication.credentials_available else 'no credentials: ' ~ (r.authentication.reason or 'unavailable') }})</td></tr>
+    {% if r.authentication.login_endpoint %}<tr><th>Login endpoint</th><td class="mono">{{ r.authentication.login_endpoint }} (found by {{ r.authentication.login_detected_by }}{{ ', LLM-assisted' if r.authentication.llm_used }})</td></tr>{% endif %}
+    <tr><th>Re-logins</th><td>{{ r.authentication.relogins or 0 }}{% if r.authentication.retried_requests %} ({{ r.authentication.retried_requests }} request(s) retried after a 401){% endif %}</td></tr>
+    {% for n in r.authentication.notes %}<tr><th>Note</th><td>{{ n }}</td></tr>{% endfor %}
+  </table>
+  {% endif %}
+
   <h2>Environment and policy</h2>
   <table>
     <tr><th>Tool versions</th><td class="mono">{% for k, v in r.tool_versions.items() %}{{ k }}={{ v or 'not found' }} {% endfor %}</td></tr>

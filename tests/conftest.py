@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import os
 import socket
 import subprocess
 import sys
@@ -42,6 +44,36 @@ def sample_server():
                 time.sleep(0.25)
         else:
             raise RuntimeError("sample server did not start")
+        yield url
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+FIXTURES = ROOT / "tests" / "fixtures"
+
+
+@contextlib.contextmanager
+def launch_app(app_dir: Path, env: dict[str, str] | None = None, probe: str = "/openapi.json"):
+    """Run a FastAPI fixture app (module `app.main:app` under `app_dir`) on a free port; yield its base URL."""
+    port = free_port()
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "app.main:app", "--app-dir", str(app_dir), "--port", str(port), "--log-level", "warning"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env={**os.environ, **(env or {})},
+    )
+    url = f"http://127.0.0.1:{port}"
+    try:
+        for _ in range(60):
+            try:
+                if httpx.get(url + probe, timeout=1).status_code == 200:
+                    break
+            except httpx.HTTPError:
+                time.sleep(0.25)
+        else:
+            raise RuntimeError(f"{app_dir.name} did not start")
         yield url
     finally:
         proc.terminate()

@@ -48,6 +48,7 @@ class QAReport(BaseModel):
     tool_versions: dict[str, str | None] = Field(default_factory=dict)
     target: dict[str, Any] = Field(default_factory=dict)
     policy: dict[str, Any] = Field(default_factory=dict)
+    authentication: dict[str, Any] = Field(default_factory=dict)  # method, login endpoint, how found, re-logins; never values
     discovery: dict[str, Any] = Field(default_factory=dict)
     coverage: CoverageSummary = Field(default_factory=CoverageSummary)
     status_counts: dict[str, int] = Field(default_factory=dict)

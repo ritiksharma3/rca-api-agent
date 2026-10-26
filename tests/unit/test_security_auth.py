@@ -130,7 +130,7 @@ def test_login_success_extracts_token_and_hides_it(monkeypatch):
     _mock_login(monkeypatch, handler)
     res = LoginProvider(_login_cfg()).resolve("http://api.test/v1")
     assert seen["url"] == "http://api.test/v1/auth/login" and seen["body"] == {"username": "qa", "password": "pa55word!"}
-    assert res.available and res.env_vars == {"auth_token": "abcdef123456"}
+    assert res.available and res.env_vars["auth_token"] == "abcdef123456"
     assert set(res.secrets) == {"pa55word!", "abcdef123456"} and res.notes
 
 
@@ -162,12 +162,14 @@ def test_login_connection_error_is_redacted(monkeypatch):
     assert "pa55word!" not in str(exc.value)
 
 
-def test_login_without_credentials_is_unavailable_and_needs_path(monkeypatch):
+def test_login_without_credentials_is_unavailable_and_unknown_endpoint_is_an_auth_error(monkeypatch):
     monkeypatch.delenv("API_AGENT_USERNAME", raising=False)
     monkeypatch.delenv("API_AGENT_PASSWORD", raising=False)
     assert not LoginProvider(_login_cfg()).resolve("http://x").available
-    with pytest.raises(InvalidInputError):
-        LoginProvider(AuthConfig(method="login")).resolve("http://x")
+    monkeypatch.setenv("API_AGENT_USERNAME", "qa")
+    monkeypatch.setenv("API_AGENT_PASSWORD", "pa55word!")
+    with pytest.raises(AuthenticationError, match="--login-path"):  # nothing to detect from and no --login-path
+        LoginProvider(AuthConfig(method="login"), use_llm=False).resolve("http://x")
     assert build_provider(AuthConfig(method="none")).resolve("http://x").available is False
 
 

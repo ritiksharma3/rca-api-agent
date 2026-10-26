@@ -195,7 +195,7 @@ def _prompt_secrets(auth: AuthConfig) -> None:
         os.environ[auth.token_env] = typer.prompt("Bearer token", hide_input=True)
     elif auth.method == "api-key" and not os.environ.get(auth.api_key_env):
         os.environ[auth.api_key_env] = typer.prompt("API key", hide_input=True)
-    elif auth.method == "login":
+    elif auth.method in ("login", "session", "basic"):
         if not os.environ.get(auth.username_env):
             os.environ[auth.username_env] = typer.prompt("Login username")
         if not os.environ.get(auth.password_env):
@@ -212,12 +212,12 @@ def generate(
     allow_mutating: Annotated[bool, typer.Option(help="Include POST/PUT/PATCH scenarios.")] = False,
     allow_destructive: Annotated[bool, typer.Option(help="Include DELETE scenarios (never run against public hosts).")] = False,
     negative: Annotated[bool, typer.Option(help="Include negative (invalid input) scenarios.")] = False,
-    auth: Annotated[Optional[str], typer.Option(help="none | bearer | login | api-key (affects which scenarios can be generated).")] = None,
+    auth: Annotated[Optional[str], typer.Option(help="none | bearer | login | api-key | basic | session (affects which scenarios can be generated).")] = None,
     seed: Annotated[Optional[int], typer.Option(help="Random seed for reproducible test data.")] = None,
     max_requests: Annotated[Optional[int], typer.Option(help="Maximum requests in the collection.")] = None,
 ) -> None:
     """Generate the Postman collection, environment template and test plan (no requests are sent)."""
-    from .auth.provider import AuthResolution
+    from .auth.provider import assumed_resolution
     from .pipeline import do_generate
 
     cfg = _discovery_args(ProjectConfig.load(output), backend, framework, strategy, spec, None).merged(
@@ -226,9 +226,7 @@ def generate(
                       spec=cfg.spec, allow_cli=cli_discovery, progress=_say)
     require_endpoints(run)
     # assume credentials will exist at test time when an auth method is configured; real check happens in `test`
-    assumed = AuthResolution(cfg.auth.method, cfg.auth.method != "none", None if cfg.auth.method != "none" else "no auth configured",
-                             header_name="Authorization" if cfg.auth.method in ("bearer", "login") else (cfg.auth.api_key_header if cfg.auth.method == "api-key" else None),
-                             header_value_template="Bearer {{auth_token}}" if cfg.auth.method in ("bearer", "login") else ("{{api_key}}" if cfg.auth.method == "api-key" else None))
+    assumed = assumed_resolution(cfg.auth)
     policy = SafetyPolicy(allow_mutating=allow_mutating, allow_destructive=allow_destructive, allow_negative=negative, max_requests=cfg.max_requests)
     gen = do_generate(run.inventory, output, GenerationOptions(policy=policy, auth=assumed, fixtures=Fixtures.load(Path(cfg.fixtures) if cfg.fixtures else None), seed=cfg.seed), _say)
     cfg.save(output)
@@ -257,14 +255,16 @@ def test(
     concurrency: Annotated[int, typer.Option(help="Accepted for policy completeness; Newman runs sequentially.")] = 1,
     request_timeout: Annotated[Optional[int], typer.Option(help="Per-request timeout (ms).")] = None,
     process_timeout: Annotated[Optional[int], typer.Option(help="Overall Newman timeout (s).")] = None,
-    auth: Annotated[Optional[str], typer.Option(help="none | bearer | login | api-key")] = None,
+    auth: Annotated[Optional[str], typer.Option(help="none | bearer | login | api-key | basic | session. 'login' logs in with the username/password env vars and finds the login endpoint itself unless --login-path is given.")] = None,
     token_env: Annotated[Optional[str], typer.Option(help="Env var holding the bearer token.")] = None,
     username_env: Annotated[Optional[str], typer.Option(help="Env var holding the login username.")] = None,
     password_env: Annotated[Optional[str], typer.Option(help="Env var holding the login password.")] = None,
     api_key_env: Annotated[Optional[str], typer.Option(help="Env var holding the API key.")] = None,
     api_key_header: Annotated[Optional[str], typer.Option(help="Header (or query) name for the API key.")] = None,
     login_path: Annotated[Optional[str], typer.Option(help="Login endpoint path or URL (for --auth login).")] = None,
-    login_token_path: Annotated[Optional[str], typer.Option(help="Dotted path to the token in the login response.")] = None,
+    login_token_path: Annotated[Optional[str], typer.Option(help="Dotted path to the token in the login response, or header:Name. Default: auto-detect.")] = None,
+    login_content_type: Annotated[Optional[str], typer.Option(help="json | form. Default: taken from the detected login endpoint (json).")] = None,
+    no_llm: Annotated[bool, typer.Option(help="Never use the OpenRouter LLM assist to find the login endpoint (it needs OPENROUTER_API_KEY and sends route/field names and short redacted handler snippets, never credentials).")] = False,
     prompt_credentials: Annotated[bool, typer.Option(help="Prompt (hidden) for missing credentials.")] = False,
     fixtures: Annotated[Optional[Path], typer.Option(help="YAML test data for pre-existing resources.")] = None,
     seed: Annotated[Optional[int], typer.Option(help="Random seed for reproducible test data.")] = None,
@@ -277,8 +277,11 @@ def test(
         "fixtures": str(fixtures) if fixtures else None,
         "auth": {"method": auth, "token_env": token_env, "username_env": username_env, "password_env": password_env,
                  "api_key_env": api_key_env, "api_key_header": api_key_header, "login_path": login_path,
-                 "login_token_path": login_token_path},
+                 "login_token_path": login_token_path, "login_content_type": login_content_type,
+                 "use_llm": False if no_llm else None},
     })
+    if cfg.auth.login_content_type not in (None, "json", "form"):
+        raise InvalidInputError("--login-content-type must be 'json' or 'form'")
     if not cfg.base_url:
         raise InvalidInputError("--base-url is required (e.g. --base-url http://127.0.0.1:8000)")
     target = parse_target(cfg.base_url)
@@ -296,8 +299,13 @@ def test(
     outcome = do_test(
         folder, output, cfg.base_url, policy, cfg.auth, fixtures_path=Path(cfg.fixtures) if cfg.fixtures else None,
         seed=cfg.seed, backend=cfg.backend, framework=cfg.framework, strategy=cfg.strategy, spec=cfg.spec,
-        allow_cli=cli_discovery, runtime_spec_url=cfg.runtime_spec_url, progress=_say,
+        allow_cli=cli_discovery, runtime_spec_url=cfg.runtime_spec_url, use_llm=cfg.auth.use_llm, progress=_say,
     )
+    if outcome.login_spec is not None:  # remember what worked (non-secret) so the next run skips detection
+        ls = outcome.login_spec
+        cfg.auth.login_path, cfg.auth.login_content_type = ls.path, ls.content_type  # type: ignore[assignment]
+        cfg.auth.login_username_field, cfg.auth.login_password_field = ls.username_field, ls.password_field
+        cfg.auth.login_token_path = ls.token_path or cfg.auth.login_token_path
     if approved and target.origin not in cfg.approved_targets:
         cfg.approved_targets.append(target.origin)
     cfg.save(output)  # only non-secret settings; risky permissions are never persisted

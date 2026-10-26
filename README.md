@@ -140,21 +140,47 @@ pytest -q
 
 ## Authentication
 
-Methods: `--auth none | bearer | login | api-key`. Secrets come from **environment variables** (names configurable) or a
+Methods: `--auth none | bearer | login | api-key | basic | session`. Secrets come from **environment variables** (names configurable) or a
 hidden interactive prompt (`--prompt-credentials`) — never from flags, config files, source files or Git history.
 
 | Method | Variables (defaults) | Notes |
 |---|---|---|
 | bearer | `API_AGENT_TOKEN` | `Authorization: Bearer {{auth_token}}` |
-| login | `API_AGENT_USERNAME`, `API_AGENT_PASSWORD`, plus `--login-path`, `--login-token-path` (dotted, default `access_token`) | The response must be JSON containing a string token or authentication fails. Redirects are not followed. No automatic refresh in V1 (an `expires_in` is noted in the report). |
+| login | `API_AGENT_USERNAME`, `API_AGENT_PASSWORD` | **Automatic**: finds the login endpoint, logs in, uses the returned token on every request (see below). `--login-path`, `--login-token-path`, `--login-content-type` override detection. |
+| session | same as login | Cookie/session login: the `Set-Cookie` values from the login response are sent as a `Cookie` header. |
+| basic | same as login | `Authorization: Basic …` built from the username/password; no login call. |
 | api-key | `API_AGENT_API_KEY`, `--api-key-header` | header (default `X-API-Key`) |
+
+### Automatic login (`--auth login`)
+
+```bash
+export API_AGENT_USERNAME=admin API_AGENT_PASSWORD=...        # PowerShell: $env:API_AGENT_USERNAME = "admin"
+api-agent test ./backend --base-url http://127.0.0.1:8000 --approve-target --auth login --allow-mutating
+```
+
+1. **Find the login endpoint** from the discovered endpoints: a POST whose route looks like `login | signin | authenticate | token | session | oauth`,
+   whose body has a password-like field (the username/email field name is taken from the schema), and — when documented — whose response has a
+   token field. Candidates are tried best-first. JSON and `application/x-www-form-urlencoded` (OAuth2 password flow) bodies are supported.
+2. **LLM fallback (optional).** If no candidate works, and `OPENROUTER_API_KEY` is set and you did not pass `--no-llm`, the agent asks an
+   OpenRouter model (`OPENROUTER_MODEL`) to pick the login endpoint. It sends only route/method/field names and a few short, redacted handler
+   snippets — **never the username, password or any token — but it does send parts of your source**, so use `--no-llm` for code that must not
+   leave the machine. A suggestion is only trusted after a real login with it succeeds; the report records that the LLM was used.
+3. **Log in and extract the token** (common locations such as `access_token`, `token`, `data.token`, or a response header via `--login-token-path header:X-Auth-Token`).
+   Wrong credentials stop immediately (exit 6) instead of being replayed against other endpoints.
+4. **Use it everywhere**: every request that needs auth gets `Authorization: Bearer {{auth_token}}`; the value is injected at run time only.
+5. **Re-login on 401**: requests that were rejected with 401 although a credential was attached are retried **once** with a fresh login
+   (the same endpoint that worked). Still-rejected requests are reported with reason `AUTH_REJECTED_AFTER_RELOGIN`.
+6. The detected, non-secret login settings are saved in `<output>/.api-agent.yaml`, so the next run skips detection.
+
+The login endpoint's own test uses your credentials and runs **last** (a new login can invalidate the token the rest of the run uses, and
+Newman's cookie jar would otherwise leak a session cookie into the "no credentials" checks). The report's *Authentication* section shows the
+method, login endpoint, how it was found, and the re-login count — never any token.
 
 How secrets are handled: the generated collection contains `{{auth_token}}`-style variables only; values reach Newman
 through a private temporary environment file that is created with owner-only permissions and **always deleted**, and every
 secret value is registered with the redaction layer (logs, exceptions, report, artifacts). Raw Newman output (which can
 contain bodies) is deleted after parsing. If an endpoint requires auth and no credentials are available, its positive
-test is `BLOCKED` (the unauthenticated "must be rejected" check still runs). Basic Auth and cookie/session flows are not
-implemented (extension point: `auth/provider.py`).
+test is `BLOCKED` (the unauthenticated "must be rejected" check still runs). Basic Auth and `session` covers cookie logins; see the limitations below for what is still missing (extension point: `auth/provider.py`).
 
 ## Target safety policy
 
@@ -254,7 +280,10 @@ tests/            unit/ (no network, no Newman) · integration/ (local sample AP
 * Discovery can miss dynamically registered, conditional, plugin- or middleware-defined routes; counts are lower bounds unless a framework registry is authoritative.
 * Authentication requirements from static analysis are inferred from dependency/decorator/annotation names only.
 * Request bodies for Express/Flask are inferred from usage (types unknown); Laravel validation rules are not parsed.
-* One global auth method per run; no token refresh; no Basic/cookie auth; no multipart bodies.
+* One global auth method and one account (e.g. a super-admin) per run, so role-restricted behaviour is not compared across roles.
+* No refresh-token flows, MFA/CAPTCHA, or logins that need a CSRF token / multi-step handshake; re-login on 401 is a single retry pass.
+* Login detection is heuristic (plus the optional LLM fallback); an unusual login endpoint needs `--login-path`. Detection is verified only against the bundled fixture apps.
+* No multipart bodies.
 * Negative-test expectations (400/422) are inferred unless the spec documents client errors.
 * Newman is sequential; the HTML report is our own (Newman's HTML reporter is not used).
 * Not yet verified against a live Laravel/Spring/ASP.NET/Go/Express *server*; those analyzers are verified on synthetic source fixtures only.

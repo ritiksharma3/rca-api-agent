@@ -25,6 +25,7 @@ from .test_data import CannotGenerate, DataGenerator
 COLLECTION_SCHEMA = "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
 BODY_METHODS = {"POST", "PUT", "PATCH"}
 SUPPORTED_BODY_TYPES = ("application/json", "application/x-www-form-urlencoded")
+LOGIN_TIER = 3
 _ID_NAME = re.compile(r"(^|_)id$|[a-z]Id$|^id$", re.I)
 
 
@@ -146,6 +147,12 @@ class _Generator:
         allowed, code, why = self.policy.method_decision(ep.method)
         has_auth = bool(self.auth and self.auth.available)
 
+        # the endpoint the agent logged in through is exercised with the runtime credentials, without a token
+        login = self.auth.login if self.auth else None
+        if login is not None and login.endpoint_id == ep.id:
+            self._login_endpoint(ep, fx, login, allowed, code, why)
+            return
+
         # ----- positive
         if not allowed:
             self._block(ep, Scenario.POSITIVE, code, why, True)
@@ -180,6 +187,19 @@ class _Generator:
         elif not self.policy.allow_negative:
             pass  # negative tests not requested: simply not part of the plan
 
+    def _login_endpoint(self, ep: Endpoint, fx: EndpointFixture, login: Any, allowed: bool, code: str, why: str) -> None:
+        if not allowed:
+            self._block(ep, Scenario.POSITIVE, code, why, True)
+            return
+        body = {login.username_field: "{{auth_username}}", login.password_field: "{{auth_password}}"}  # filled in by Newman at run time
+        ct = "application/x-www-form-urlencoded" if login.content_type == "form" else "application/json"
+        try:
+            built = self._positive(ep, fx, attach_auth=False, body_override=body, ct_override=ct)
+            built.tier = LOGIN_TIER  # a fresh login can invalidate the token the rest of the run is using (single-session servers)
+            self.built.append(built)
+        except CannotGenerate as exc:
+            self._block(ep, Scenario.POSITIVE, "MISSING_FIXTURE", str(exc), True)
+
     # ---------------------------------------------------------------- request building
     def _resolve_inputs(self, ep: Endpoint, fx: EndpointFixture) -> tuple[dict[str, Any], list[tuple[str, Any]], dict[str, str]]:
         path_vals: dict[str, Any] = {}
@@ -213,9 +233,10 @@ class _Generator:
             return None
         return self.data.valid(rb.schema_def, None, required=True)
 
-    def _positive(self, ep: Endpoint, fx: EndpointFixture, attach_auth: bool, scenario: Scenario = Scenario.POSITIVE) -> _Built:
+    def _positive(self, ep: Endpoint, fx: EndpointFixture, attach_auth: bool, scenario: Scenario = Scenario.POSITIVE,
+                  body_override: Any = None, ct_override: str | None = None) -> _Built:
         path_vals, query, headers = self._resolve_inputs(ep, fx)
-        body = self._body(ep, fx)
+        body = body_override if body_override is not None else self._body(ep, fx)
         if scenario == Scenario.AUTH_REQUIRED:
             expected, basis, rng = [401, 403], "inferred: endpoint declares an authentication requirement", None
             desc = "request without credentials must be rejected (401/403)"
@@ -237,7 +258,7 @@ class _Generator:
                 tests += json_schema_assertion(to_json_schema(schema))
         tests += response_time_assertion(self.policy.request_timeout_ms)
         item_id = f"{ep.id}|{scenario.value}|0"
-        item = self._item(ep, item_id, scenario, path_vals, query, headers, body, attach_auth, tests, desc)
+        item = self._item(ep, item_id, scenario, path_vals, query, headers, body, attach_auth, tests, desc, ct_override)
         pr = PlannedRequest(item_id=item_id, endpoint_id=ep.id, scenario=scenario, method=ep.method, route=ep.route,
                             required=scenario == Scenario.POSITIVE, expected_statuses=expected if expected else ([] if not rng else []),
                             expected_basis=basis, description=desc)
@@ -268,7 +289,8 @@ class _Generator:
         return out
 
     def _item(self, ep: Endpoint, item_id: str, scenario: Scenario, path_vals: dict[str, Any], query: list[tuple[str, Any]],
-              headers: dict[str, str], body: Any, attach_auth: bool, tests: list[str], desc: str) -> dict[str, Any]:
+              headers: dict[str, str], body: Any, attach_auth: bool, tests: list[str], desc: str,
+              ct_override: str | None = None) -> dict[str, Any]:
         path = ep.route
         for k, v in path_vals.items():
             path = path.replace("{" + k + "}", quote(str(v), safe=""))
@@ -294,7 +316,7 @@ class _Generator:
             "description": desc,
         }
         if body is not None:
-            ct = (ep.request_body.content_type if ep.request_body else "application/json")
+            ct = ct_override or (ep.request_body.content_type if ep.request_body else "application/json")
             if "x-www-form-urlencoded" in ct and isinstance(body, dict):
                 request["body"] = {"mode": "urlencoded", "urlencoded": [{"key": k, "value": str(v)} for k, v in body.items()]}
                 hdrs.append({"key": "Content-Type", "value": "application/x-www-form-urlencoded"})
@@ -321,7 +343,13 @@ class _Generator:
                                                 route=b.request.route, required=b.request.required, reason_code="REQUEST_BUDGET",
                                                 reason=f"--max-requests={self.policy.max_requests} reached"))
         folders: dict[str, list[dict[str, Any]]] = {}
+        # The login endpoint's own test runs last: Newman runs folders in order, a fresh login can invalidate the token the
+        # rest of the run uses, and Newman's cookie jar would otherwise attach the new session cookie to the "no credentials" checks.
+        last: list[dict[str, Any]] = []
         for b in sorted(kept, key=lambda x: (x.request.route, x.request.method, x.request.scenario.value, x.item["id"])):
+            if b.tier == LOGIN_TIER:
+                last.append(b.item)
+                continue
             seg = next((s for s in b.request.route.split("/") if s), "root")
             folders.setdefault(seg, []).append(b.item)
         collection = {
@@ -331,13 +359,15 @@ class _Generator:
                 "description": "Generated by api-testing-agent. Contains no secrets; credentials come from the runtime environment.",
                 "schema": COLLECTION_SCHEMA,
             },
-            "item": [{"name": name, "item": items} for name, items in sorted(folders.items())],
+            "item": [{"name": name, "item": items} for name, items in sorted(folders.items())]
+            + ([{"name": "login endpoint (runs last)", "item": last}] if last else []),
         }
         env_values = [{"key": "base_url", "value": "", "type": "default", "enabled": True}]
-        if self.auth and self.auth.method in ("bearer", "login"):
-            env_values.append({"key": "auth_token", "value": "", "type": "secret", "enabled": True})
-        if self.auth and self.auth.method == "api-key":
-            env_values.append({"key": "api_key", "value": "", "type": "secret", "enabled": True})
+        secret_vars = {
+            "bearer": ["auth_token"], "login": ["auth_token", "auth_username", "auth_password"],
+            "session": ["auth_cookie", "auth_username", "auth_password"], "basic": ["auth_basic"], "api-key": ["api_key"],
+        }.get(self.auth.method if self.auth else "", [])
+        env_values += [{"key": k, "value": "", "type": "secret", "enabled": True} for k in secret_vars]
         environment = {"id": str(uuid.uuid4()), "name": "api-agent environment template", "values": env_values,
                        "_note": "Variable names only. Real values are injected at run time and never written here."}
         validate_collection(collection)
@@ -348,6 +378,23 @@ def generate(inv: EndpointInventory, opts: GenerationOptions | None = None) -> G
     g = _Generator(inv, opts or GenerationOptions())
     g.run()
     return g.assemble()
+
+
+def subset_collection(collection: dict[str, Any], item_ids: set[str]) -> dict[str, Any]:
+    """A copy of the collection holding only the requests whose item id is in `item_ids` (used for the re-login retry)."""
+
+    def keep(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for it in items:
+            if "item" in it:
+                inner = keep(it["item"])
+                if inner:
+                    out.append({**it, "item": inner})
+            elif it.get("id") in item_ids:
+                out.append(it)
+        return out
+
+    return {**collection, "item": keep(collection.get("item", []))}
 
 
 def validate_collection(c: dict[str, Any]) -> None:

@@ -11,7 +11,7 @@ from typing import Any
 import httpx
 
 from . import __version__
-from .auth.provider import AuthConfig, AuthResolution, build_provider
+from .auth.provider import AuthConfig, AuthProvider, AuthResolution, LoginSpec, build_provider
 from .discovery.base import DiscoveryContext
 from .discovery.registry import run_discovery
 from .errors import (
@@ -25,14 +25,14 @@ from .errors import (
 from .execution.newman_runner import check_dependencies, log_excerpt, run_collection
 from .execution.result_parser import parse_newman_report
 from .models.endpoint import EndpointInventory
-from .models.execution import ExecutionResult, TestPlan
+from .models.execution import ExecutionResult, Scenario, TestPlan, TestStatus
 from .models.project import DiscoveryWarning, ScanResult
 from .models.report import QAReport
 from .reporting.report_generator import build_report, overall_exit, write_reports
 from .scanner.repository_scanner import scan_repository, select_backend
 from .security.redaction import redact_text
 from .security.safety_policy import SafetyPolicy, Target, parse_target
-from .test_generation.collection_generator import Fixtures, GenerationOptions, GenerationResult, generate
+from .test_generation.collection_generator import Fixtures, GenerationOptions, GenerationResult, generate, subset_collection
 from .utils.filesystem import read_json, write_json
 
 Progress = Callable[[str], None]
@@ -58,6 +58,7 @@ class TestRunOutcome:
     json_path: Path
     html_path: Path
     extra_errors: list[str] = field(default_factory=list)
+    login_spec: LoginSpec | None = None  # non-secret login settings that worked (persisted for the next run)
 
 
 # ---------------------------------------------------------------------------- scan / discover
@@ -136,6 +137,51 @@ def do_generate(inv: EndpointInventory, out_dir: Path, opts: GenerationOptions, 
 # ---------------------------------------------------------------------------- test
 
 
+def _relogin_and_retry(
+    provider: AuthProvider, auth_res: AuthResolution, gen: GenerationResult, plan: TestPlan, execution: ExecutionResult,
+    inv: EndpointInventory, base_url: str, policy: SafetyPolicy, newman: str, out_dir: Path, secrets: list[str],
+    timeout_s: float, progress: Progress,
+) -> tuple[int, list[str]]:
+    """Requests that were rejected with 401 although a credential was attached usually mean the token expired.
+
+    Log in once more and re-run just those requests (whole scenario groups, so negative variants stay together).
+    Returns (number of requests retried, notes). Never raises for an authentication problem: the first-pass results stay.
+    """
+    public = {e.id for e in inv.endpoints if e.requires_auth is False}
+    login_id = auth_res.login.endpoint_id if auth_res.login else None
+    rejected = {
+        (s.endpoint_id, s.scenario) for s in execution.scenarios
+        if s.executed and s.http_status == 401 and s.scenario != Scenario.AUTH_REQUIRED
+        and s.endpoint_id not in public and s.endpoint_id != login_id
+    }
+    if not rejected:
+        return 0, []
+    retry = [p for p in plan.requests if (p.endpoint_id, p.scenario) in rejected]
+    progress(f"{len(retry)} request(s) were rejected with 401; logging in again and retrying them once ...")
+    try:
+        fresh = provider.resolve(base_url, timeout_s)
+    except AuthenticationError as exc:
+        return 0, [f"re-login failed, first-pass results kept: {redact_text(str(exc), secrets)}"]
+    if not fresh.available:
+        return 0, ["re-login produced no credential, first-pass results kept"]
+    secrets.extend(s for s in fresh.secrets if s not in secrets)
+    sub_plan = TestPlan(requests=retry)
+    res, raw = run_collection(subset_collection(gen.collection, {p.item_id for p in retry}), base_url, fresh.env_vars, policy, newman, out_dir, secrets)
+    if raw is None:
+        return 0, ["retry run produced no report, first-pass results kept"]
+    redone = parse_newman_report(raw, sub_plan, secrets)
+    for s in redone.scenarios:
+        if s.http_status == 401 and s.status != TestStatus.PASS:
+            s.reason_code = "AUTH_REJECTED_AFTER_RELOGIN"
+            s.reason = f"still rejected with 401 after logging in again: {s.reason or ''}".strip()[:500]
+    execution.scenarios = [s for s in execution.scenarios if (s.endpoint_id, s.scenario) not in rejected] + redone.scenarios
+    execution.total_requests_executed = sum(1 for s in execution.scenarios if s.executed)
+    execution.total_assertions = sum(len(s.assertions) for s in execution.scenarios)
+    execution.failed_assertions = sum(1 for s in execution.scenarios for a in s.assertions if not a.passed and not a.skipped)
+    execution.skipped_tests = sum(1 for s in execution.scenarios for a in s.assertions if a.skipped)
+    return len(retry), []
+
+
 def _preflight(target: Target, timeout_s: float) -> None:
     try:
         with httpx.Client(timeout=timeout_s, follow_redirects=False, verify=True) as client:
@@ -162,6 +208,7 @@ def do_test(
     allow_cli: bool = True,
     runtime_spec_url: str | None = None,
     discovery_timeout: float = 60.0,
+    use_llm: bool | None = None,
     progress: Progress = _noop,
 ) -> TestRunOutcome:
     target = parse_target(base_url)
@@ -198,10 +245,11 @@ def do_test(
     # authentication
     auth_res: AuthResolution = AuthResolution("none", False, "no authentication configured (--auth none)")
     auth_error: str | None = None
+    provider: AuthProvider = build_provider(auth_config, inv, use_llm)
     if connectivity_error is None and auth_config.method != "none":
         progress(f"Resolving authentication ({auth_config.method}) ...")
         try:
-            auth_res = build_provider(auth_config).resolve(target.base_url, policy.request_timeout_ms / 1000)
+            auth_res = provider.resolve(target.base_url, policy.request_timeout_ms / 1000)
         except AuthenticationError as exc:
             auth_error = str(exc)
             auth_res = AuthResolution(auth_config.method, False, f"authentication failed: {exc}")
@@ -209,7 +257,12 @@ def do_test(
     elif auth_config.method != "none":
         auth_res = AuthResolution(auth_config.method, False, "not attempted: target unreachable")
     secrets = list(auth_res.secrets)
-    meta["auth"] = {"method": auth_config.method, "credentials_available": auth_res.available, "reason": auth_res.reason, "notes": auth_res.notes}
+    meta["auth"] = {
+        "method": auth_config.method, "credentials_available": auth_res.available, "reason": auth_res.reason, "notes": auth_res.notes,
+        "login_endpoint": auth_res.login.path if auth_res.login else None,
+        "login_detected_by": auth_res.login.source if auth_res.login else None,
+        "llm_used": auth_res.llm_used, "relogins": 0,
+    }
 
     gen = do_generate(inv, out_dir, GenerationOptions(policy=policy, auth=auth_res, fixtures=Fixtures.load(fixtures_path), seed=seed), progress)
     plan = gen.plan
@@ -236,6 +289,12 @@ def do_test(
             else:
                 execution = parse_newman_report(raw, plan, secrets)
                 execution.newman_version = tv.newman
+                if auth_res.available and auth_res.relogin_supported:
+                    retried, notes = _relogin_and_retry(provider, auth_res, gen, plan, execution, inv, target.base_url, policy,
+                                                        newman, out_dir, secrets, policy.request_timeout_ms / 1000, progress)
+                    meta["auth"]["relogins"] = 1 if retried else 0
+                    meta["auth"]["retried_requests"] = retried
+                    meta["auth"]["notes"] = [*meta["auth"]["notes"], *notes]
             execution.newman_exit_code = res.returncode
             execution.log_excerpt = log_excerpt(res, secrets)
         except MissingDependencyError as exc:
@@ -247,7 +306,7 @@ def do_test(
     if auth_error:
         extra_errors.append(f"authentication failure: {auth_error}")
     report = build_report(inv, plan, execution, run.scan, run.warnings, meta, secrets)
-    if auth_error and not any("authentication" in b for b in report.blockers):
+    if auth_error and not any(b.startswith("authentication failure") for b in report.blockers):
         report.blockers.append(f"authentication failure: {redact_text(auth_error, secrets)}")
     json_path, html_path = write_reports(report, out_dir)
     write_json(out_dir / "execution_result.json", (execution or ExecutionResult()).model_dump(mode="json"))
@@ -258,7 +317,7 @@ def do_test(
         # supplied credentials that do not work (or an unreachable target / missing Newman) mean the run is not
         # a trustworthy verdict, so that condition outranks ordinary test failures
         code = exit_override
-    return TestRunOutcome(report, code, json_path, html_path, extra_errors)
+    return TestRunOutcome(report, code, json_path, html_path, extra_errors, login_spec=auth_res.login)
 
 
 # ---------------------------------------------------------------------------- report from artifacts

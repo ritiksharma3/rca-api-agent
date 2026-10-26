@@ -83,6 +83,7 @@ def build_report(
         tool_versions=meta.get("tool_versions", {}),
         target=meta.get("target", {}),
         policy=meta.get("policy", {}),
+        authentication=meta.get("auth", {}),
         discovery={
             "strategy_used": inv.discovery.strategy_used, "complete": inv.discovery.complete,
             "attempts": [a.model_dump() for a in inv.discovery.attempts], "limitations": inv.discovery.limitations,
