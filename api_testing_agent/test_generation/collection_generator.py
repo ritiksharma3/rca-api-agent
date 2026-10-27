@@ -83,10 +83,12 @@ def capture_script(key: str, param: str, listing: bool) -> list[str]:
             "return null; }")
     if listing:
         body = [
-            "var arr = Array.isArray(j) ? j : null;",
-            "if (!arr && j && typeof j === 'object') { var ks = ['data', 'items', 'results', 'content', 'records', 'rows'];",
-            "  for (var k = 0; k < ks.length && !arr; k++) { if (Array.isArray(j[ks[k]])) { arr = j[ks[k]]; } }",
-            "  if (!arr) { for (var p in j) { if (Array.isArray(j[p])) { arr = j[p]; break; } } } }",
+            "function findArr(o) { if (Array.isArray(o)) { return o; } if (!o || typeof o !== 'object') { return null; }",
+            "  var ks = ['data', 'items', 'results', 'content', 'records', 'rows', 'list'];",
+            "  for (var k = 0; k < ks.length; k++) { if (Array.isArray(o[ks[k]])) { return o[ks[k]]; } }",
+            "  for (var p in o) { if (Array.isArray(o[p])) { return o[p]; } } return null; }",
+            "var arr = findArr(j);",
+            "if (!arr && j && typeof j === 'object') { arr = findArr(j.data) || findArr(j.result) || findArr(j.payload); }  // {success, data: {data: [...], meta}}",
             f"if (arr && arr.length && !pm.collectionVariables.get('cur_{key}')) {{ var sid = pick(arr[0]); if (sid) {{ pm.collectionVariables.set('cur_{key}', sid); }} }}",
         ]
     else:

@@ -49,9 +49,13 @@ def run_discovery(
     if strategy not in STRATEGIES:
         raise DiscoveryError(f"unknown strategy '{strategy}' (choose from {', '.join(STRATEGIES)})")
     adapters = adapters if adapters is not None else default_adapters()
-    if ctx.spec_path is not None and strategy == "auto":
+    if ctx.spec_path is not None and strategy == "auto" and not ctx.spec_from_probe:
         strategy = "openapi"  # an explicit --spec means: use that document
     chosen = [a for a in adapters if strategy == "auto" or a.strategy == strategy]
+    if ctx.spec_from_probe:
+        # A document the live target happens to publish is a fallback and a cross-check, not the primary source: source analysis
+        # knows things a spec often omits (which routes need auth), whereas the spec rescues stacks with no source analyzer.
+        chosen = [a for a in chosen if a.strategy != "openapi"] + [a for a in chosen if a.strategy == "openapi"]
 
     attempts: list[AttemptRecord] = []
     warnings: list[DiscoveryWarning] = []

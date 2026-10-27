@@ -9,6 +9,7 @@ from ..errors import DiscoveryError
 from .base import Applicability, DiscoveryAdapter, DiscoveryContext, DiscoveryOutcome
 from .jvm_dotnet_go_static import analyze_aspnet, analyze_go, analyze_spring
 from .js_static import analyze_express
+from .nest_static import analyze_nest
 from .php_static import analyze_php
 from .python_static import PythonStaticAdapter
 
@@ -22,6 +23,17 @@ _DISPATCH: dict[str, tuple[Analyzer, list[str]]] = {
     "Express": (analyze_express, [
         "Router mounts are resolved through require()/import of relative modules and same-file identifiers only.",
         "Body/query fields are inferred from req.body/req.query usage in inline handlers; types and required-ness are unknown.",
+    ]),
+    "Fastify": (analyze_express, [
+        "Fastify: plugins are followed through relative require()/import and register(plugin, {prefix}); encapsulation rules beyond prefix and addHook auth are not modelled.",
+        "Route JSON schemas (body/querystring/params) are read when written as literals in the route options.",
+    ]),
+    "Koa": (analyze_express, [
+        "Koa: koa-router routes with new Router({prefix}) / router.prefix() and parent.use('/x', child.routes()); body/query are inferred from ctx usage only when inline handlers use req/request.",
+    ]),
+    "NestJS": (analyze_nest, [
+        "NestJS: only decorator-declared controllers; dynamic modules, RouterModule path trees and custom decorators that wrap @Get/@Post are not resolved.",
+        "DTO schemas come from class-validator decorators on classes found in the project; response schemas are not analysed.",
     ]),
     "Spring": (analyze_spring, [
         "Spring: only annotation-declared routes; functional (RouterFunction) routes, meta-annotations and inherited mappings are not resolved.",

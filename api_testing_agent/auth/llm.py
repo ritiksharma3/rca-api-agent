@@ -145,10 +145,21 @@ def _complete(system: str, user: str, max_tokens: int, timeout_s: float = 30.0) 
                "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
     try:
         resp = httpx.post(OPENROUTER_URL, headers={"Authorization": f"Bearer {key}"}, json=payload, timeout=timeout_s, follow_redirects=False)
+        if resp.status_code == 402:  # "requested up to N tokens, but can only afford M": retry once with a budget that fits
+            m = re.search(r"can only afford (\d+)", resp.text)
+            afford = int(m.group(1)) - 20 if m else 0
+            if afford >= 150:
+                payload["max_tokens"] = min(max_tokens, afford)
+                resp = httpx.post(OPENROUTER_URL, headers={"Authorization": f"Bearer {key}"}, json=payload, timeout=timeout_s, follow_redirects=False)
         resp.raise_for_status()
         text = resp.json()["choices"][0]["message"]["content"]
+    except httpx.HTTPStatusError as exc:
+        code = exc.response.status_code
+        why = {401: "the OpenRouter key was rejected", 402: "the OpenRouter account is out of credit (top up at openrouter.ai)", 403: "the key may not use this model",
+               404: f"model '{model}' not found", 429: "rate-limited by OpenRouter"}.get(code, "provider error")
+        return None, f"LLM assist failed: HTTP {code} ({why}); continuing without it"
     except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as exc:
-        return None, f"LLM assist failed: {redact_text(type(exc).__name__, [key])}"
+        return None, f"LLM assist failed: {redact_text(type(exc).__name__, [key])}; continuing without it"
     return (text if isinstance(text, str) else None), f"LLM ({model})"
 
 

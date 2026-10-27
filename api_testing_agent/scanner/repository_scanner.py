@@ -76,7 +76,13 @@ def select_backend(
     cands = scan.backends
     if backend:
         norm = backend.replace("\\", "/").strip("/") or "."
-        cands = [c for c in cands if c.path == norm]
+        exact = [c for c in cands if c.path == norm]
+        if not exact and norm != ".":
+            # A backend folder without its own manifest is attributed to the repo root; let --backend <subfolder> narrow such a
+            # candidate to the subfolder when its evidence files live there (e.g. py-api/main.py with no requirements.txt).
+            exact = [c.model_copy(update={"path": norm}) for c in cands
+                     if any(e.source.replace("\\", "/").startswith(norm + "/") for e in c.evidence)]
+        cands = exact
         if not cands:
             raise InvalidInputError(
                 f"--backend '{backend}' does not match a detected backend. Detected: "

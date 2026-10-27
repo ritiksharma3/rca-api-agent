@@ -118,3 +118,53 @@ def singular(word: str) -> str:
 
 def snake(name: str) -> str:
     return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
+
+
+_NOPE = object()
+
+
+def object_pairs(node: Any) -> dict[str, Any]:
+    """{key: value node} of a JS/TS object literal (string or identifier keys)."""
+    out: dict[str, Any] = {}
+    if node is None or node.type != "object":
+        return out
+    for pair in children_of(node, "pair"):
+        k, v = pair.child_by_field_name("key"), pair.child_by_field_name("value")
+        if k is not None and v is not None:
+            out[text(k).strip("'\"`")] = v
+    return out
+
+
+def js_literal(node: Any) -> Any:
+    """Plain Python value of a literal JS expression (objects, arrays, strings, numbers, booleans); _NOPE when it is not a literal."""
+    if node is None:
+        return _NOPE
+    t = node.type
+    if t in ("string", "template_string"):
+        v = string_value(node)
+        return v if v is not None else _NOPE
+    if t == "number":
+        s = text(node)
+        try:
+            return int(s) if re.fullmatch(r"-?\d+", s) else float(s)
+        except ValueError:
+            return _NOPE
+    if t in ("true", "false"):
+        return t == "true"
+    if t == "null":
+        return None
+    if t == "array":
+        vals = [js_literal(c) for c in named_children(node)]
+        return [v for v in vals if v is not _NOPE]
+    if t == "object":
+        out = {}
+        for k, v in object_pairs(node).items():
+            val = js_literal(v)
+            if val is not _NOPE:
+                out[k] = val
+        return out
+    return _NOPE
+
+
+def is_literal(value: Any) -> bool:
+    return value is not _NOPE

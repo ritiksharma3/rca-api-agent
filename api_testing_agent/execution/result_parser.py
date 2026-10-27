@@ -29,6 +29,16 @@ def _body_snippet(response: dict[str, Any], secrets: list[str]) -> str | None:
     return truncate(redact_text(text, secrets), BODY_SNIPPET)
 
 
+def _retry_after(response: dict[str, Any]) -> int | None:
+    for h in response.get("header") or []:
+        if isinstance(h, dict) and str(h.get("key", "")).lower() == "retry-after":
+            try:
+                return max(int(float(str(h.get("value")))), 0)
+            except ValueError:
+                return None
+    return None
+
+
 def parse_newman_report(raw: dict[str, Any], plan: TestPlan, secrets: list[str]) -> ExecutionResult:
     result = ExecutionResult()
     run = raw.get("run", {}) if isinstance(raw, dict) else {}
@@ -77,10 +87,21 @@ def parse_newman_report(raw: dict[str, Any], plan: TestPlan, secrets: list[str])
             snippet = _body_snippet(resp, secrets)
             if snippet:
                 evidence["response_body_snippet"] = snippet
+        reason_code = None if status != TestStatus.BLOCKED else "NO_ASSERTIONS"
+        code = resp.get("code")
+        if status == TestStatus.FAIL and pr.scenario.value == "positive":
+            if code == 403:
+                reason_code = "FORBIDDEN_FOR_USER"
+                reason = ("the server answered 403: this account is authenticated but may lack the role/permission this endpoint needs "
+                          "(use an account that has it, or treat as a defect if it should be allowed). " + (reason or ""))[:500]
+            elif code == 429:
+                reason_code = "RATE_LIMITED"
+                reason = "the server rate-limited this request (HTTP 429); raise --delay-ms. " + (reason or "")
+                evidence["retry_after_s"] = _retry_after(resp)
         result.scenarios.append(
-            ScenarioResult(**base, status=status, executed=bool(real), http_status=resp.get("code"),
+            ScenarioResult(**base, status=status, executed=bool(real), http_status=code,
                            duration_ms=resp.get("responseTime"), reason=reason,
-                           reason_code=None if status != TestStatus.BLOCKED else "NO_ASSERTIONS", evidence=evidence)
+                           reason_code=reason_code, evidence=evidence)
         )
 
     for pr in plan.requests:  # planned but never reported by Newman

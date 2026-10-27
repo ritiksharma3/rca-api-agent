@@ -75,7 +75,7 @@ _SOURCE_RULES: dict[str, list[tuple[str, re.Pattern[str], str]]] = {
     ".js": [
         ("express", re.compile(r"""require\(\s*['"]express['"]\s*\)|from\s+['"]express['"]"""), "imports express"),
         ("fastify", re.compile(r"""require\(\s*['"]fastify['"]\s*\)|from\s+['"]fastify['"]"""), "imports fastify"),
-        ("koa", re.compile(r"""require\(\s*['"]koa-router['"]\s*\)|from\s+['"]@koa/router['"]"""), "imports koa router"),
+        ("koa", re.compile(r"""require\(\s*['"](?:koa-router|@koa/router|koa)['"]\s*\)|from\s+['"](?:koa-router|@koa/router|koa)['"]"""), "imports koa / koa-router"),
     ],
     ".java": [
         ("spring", re.compile(r"@(?:RestController|RequestMapping|GetMapping|PostMapping)\b"), "Spring MVC annotations"),
@@ -114,7 +114,7 @@ def _scan_manifest(path: Path, root: Path, sig: _Signals) -> None:
             if re.search(pat, low):
                 sig.add(fw, src, f"declares {fw} dependency", manifest=True)
     elif name == "package.json":
-        for fw, pkg in (("express", '"express"'), ("fastify", '"fastify"'), ("nestjs", '"@nestjs/core"'), ("koa", '"koa-router"')):
+        for fw, pkg in (("express", '"express"'), ("fastify", '"fastify"'), ("nestjs", '"@nestjs/core"'), ("koa", '"koa-router"'), ("koa", '"@koa/router"')):
             if pkg in low:
                 sig.add(fw, src, f"package.json depends on {pkg.strip(chr(34))}", manifest=True)
     elif name in ("pom.xml", "build.gradle", "build.gradle.kts"):

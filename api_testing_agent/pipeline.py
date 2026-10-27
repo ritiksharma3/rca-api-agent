@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import platform
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -37,6 +38,7 @@ from .security.safety_policy import SafetyPolicy, Target, parse_target
 from .test_generation.collection_generator import EndpointFixture, Fixtures, GenerationOptions, GenerationResult, generate, subset_collection
 from .utils.filesystem import read_json, write_json
 
+MAX_RATE_LIMIT_WAIT_S = 90  # longest we wait on a Retry-After before the single retry
 Progress = Callable[[str], None]
 
 
@@ -85,11 +87,13 @@ def do_discover(
     allow_cli: bool = True,
     runtime_spec_url: str | None = None,
     policy: SafetyPolicy | None = None,
+    probe_base_url: str | None = None,
     progress: Progress = _noop,
 ) -> DiscoveryRun:
     scan = do_scan(folder, out_dir, progress)
     root = Path(scan.root)
     spec_path: Path | None = None
+    from_probe = False
     if spec:
         spec_path = Path(spec).expanduser()
         if not spec_path.is_file():
@@ -101,14 +105,28 @@ def do_discover(
         progress(f"Fetching runtime spec from {runtime_spec_url} (explicitly enabled) ...")
         spec_path = fetch_runtime_spec(runtime_spec_url, policy or SafetyPolicy(), out_dir / "runtime_spec")
 
+    if spec_path is None and probe_base_url and strategy in ("auto", "openapi") and policy is not None:
+        from .discovery.runtime_adapter import probe_runtime_spec
+
+        found, note = probe_runtime_spec(probe_base_url, policy, out_dir / "runtime_spec")
+        progress(f"Runtime spec: {note}")
+        if found is not None:
+            spec_path, from_probe = found, True
+
     selected = None
     if scan.backends or not spec_path:
         selected = select_backend(scan, backend, framework) if (scan.backends or not spec_path) else None
     if selected:
         progress(f"Backend: {selected.framework} ({selected.language}) at '{selected.path}' [{selected.confidence.value} confidence]")
-    ctx = DiscoveryContext(root=root, scan=scan, backend=selected, spec_path=spec_path, timeout=timeout, allow_cli=allow_cli)
+    ctx = DiscoveryContext(root=root, scan=scan, backend=selected, spec_path=spec_path, timeout=timeout, allow_cli=allow_cli, spec_from_probe=from_probe)
     progress(f"Discovering endpoints (strategy={strategy}) ...")
     inv, warns = run_discovery(ctx, strategy)
+    for a in inv.discovery.attempts:  # why a preferred strategy was skipped / failed must be visible, not buried in a JSON file
+        if a.outcome == "failed":
+            first = (a.detail or "").strip().splitlines()[0][:220] if (a.detail or "").strip() else "no detail"
+            progress(f"  discovery: {a.adapter} failed ({first}); fell back to the next strategy")
+    if inv.discovery.strategy_used:
+        progress(f"  discovery: using {inv.discovery.strategy_used} ({len(inv.endpoints)} endpoint(s))")
     write_json(out_dir / "scan_result.json", scan.model_dump(mode="json"))
     write_json(out_dir / "endpoint_inventory.json", inv.model_dump(mode="json"))
     write_json(out_dir / "discovery_warnings.json", [w.model_dump(mode="json") for w in warns])
@@ -186,14 +204,52 @@ def _relogin_and_retry(
     return len(retry), []
 
 
+def _retry_rate_limited(
+    gen: GenerationResult, plan: TestPlan, execution: ExecutionResult, base_url: str, policy: SafetyPolicy, newman: str,
+    out_dir: Path, secrets: list[str], env_vars: dict[str, str], progress: Progress,
+) -> tuple[int, list[str]]:
+    """Requests answered 429 are retried once after the server's Retry-After (capped), then reported as they come out."""
+    limited = {(s.endpoint_id, s.scenario) for s in execution.scenarios if s.executed and s.http_status == 429}
+    if not limited:
+        return 0, []
+    waits = [s.evidence.get("retry_after_s") for s in execution.scenarios if s.http_status == 429 and isinstance(s.evidence.get("retry_after_s"), int)]
+    wait = min(max(waits or [30]), MAX_RATE_LIMIT_WAIT_S)
+    retry = [p for p in plan.requests if (p.endpoint_id, p.scenario) in limited]
+    progress(f"{len(retry)} request(s) were rate-limited (429); waiting {wait}s and retrying them once ...")
+    time.sleep(wait)
+    sub_plan = TestPlan(requests=retry)
+    res, raw = run_collection(subset_collection(gen.collection, {p.item_id for p in retry}), base_url, env_vars, policy, newman, out_dir, secrets)
+    if raw is None:
+        return 0, ["rate-limit retry produced no report, first-pass results kept"]
+    redone = parse_newman_report(raw, sub_plan, secrets)
+    execution.scenarios = [s for s in execution.scenarios if (s.endpoint_id, s.scenario) not in limited] + redone.scenarios
+    execution.total_requests_executed = sum(1 for s in execution.scenarios if s.executed)
+    execution.total_assertions = sum(len(s.assertions) for s in execution.scenarios)
+    execution.failed_assertions = sum(1 for s in execution.scenarios for a in s.assertions if not a.passed and not a.skipped)
+    execution.skipped_tests = sum(1 for s in execution.scenarios for a in s.assertions if a.skipped)
+    return len(retry), []
+
+
 def _preflight(target: Target, timeout_s: float) -> None:
     try:
         with httpx.Client(timeout=timeout_s, follow_redirects=False, verify=True) as client:
             client.get(target.base_url or target.origin)
     except httpx.HTTPError as exc:
-        raise TargetConnectivityError(
-            f"Cannot reach {target.origin}: {redact_text(type(exc).__name__ + ': ' + str(exc))}"
-        ) from exc
+        raise TargetConnectivityError(f"Cannot reach {target.origin}: {_connectivity_cause(exc, timeout_s)}") from exc
+
+
+def _connectivity_cause(exc: httpx.HTTPError, timeout_s: float) -> str:
+    """Say what the failure means, not just its exception class: refused vs. slow vs. accepted-but-silent."""
+    detail = redact_text(f"{type(exc).__name__}: {exc}")
+    if isinstance(exc, httpx.ReadTimeout):
+        return (f"the server accepted the connection but did not answer within {timeout_s:g}s. A single-threaded dev server (php -S, "
+                "flask run, node with a blocking call) stuck on a dependency such as a database, Redis or an external API is the usual cause; "
+                f"check the application's log and that its dependencies are reachable. ({detail})")
+    if isinstance(exc, httpx.ConnectTimeout):
+        return f"could not open a connection within {timeout_s:g}s; check the host, port, VPN or firewall. ({detail})"
+    if isinstance(exc, httpx.ConnectError):
+        return f"connection refused or host unreachable; is the server running at that address and port? ({detail})"
+    return detail
 
 
 def _suggest_bodies(inv: EndpointInventory, fixtures: Fixtures, auth_res: AuthResolution, policy: SafetyPolicy, allowed: bool, progress: Progress) -> dict[str, Any]:
@@ -247,7 +303,7 @@ def do_test(
 
     run = do_discover(folder, out_dir, backend=backend, framework=framework, strategy=strategy, spec=spec,
                       timeout=discovery_timeout, allow_cli=allow_cli, runtime_spec_url=runtime_spec_url,
-                      policy=policy, progress=progress)
+                      policy=policy, probe_base_url=base_url, progress=progress)
     inv = run.inventory
     require_endpoints(run)
     if inv.server_base_path and target.base_path != inv.server_base_path:
@@ -344,6 +400,12 @@ def do_test(
                     meta["auth"]["retried_requests"] = retried
                     meta["auth"]["login_requests"] = getattr(provider, "login_requests", meta["auth"]["login_requests"])
                     meta["auth"]["notes"] = [*meta["auth"]["notes"], *notes]
+                limited_retried, limit_notes = _retry_rate_limited(gen, plan, execution, target.base_url, policy, newman, out_dir, secrets,
+                                                                   auth_res.env_vars, progress)
+                if limited_retried:
+                    meta["rate_limited_retried"] = limited_retried
+                if limit_notes:
+                    meta.setdefault("notes", []).extend(limit_notes)
             execution.newman_exit_code = res.returncode
             execution.log_excerpt = log_excerpt(res, secrets)
         except MissingDependencyError as exc:

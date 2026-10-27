@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -139,6 +141,53 @@ def _controller_ref(arg: Any | None) -> str | None:
     return None
 
 
+_BASE_PATH = re.compile(r"""^\(?\s*(?:base_path|app_path)\(\s*['"]([^'"]+)['"]\s*\)\s*\)?$""")
+_DIR_CONCAT = re.compile(r"""^__DIR__\s*\.\s*['"]([^'"]+)['"]$""")
+_INCLUDE_NODES = {"require_expression", "require_once_expression", "include_expression", "include_once_expression"}
+MAX_INCLUDE_DEPTH = 8
+MAX_FILES = 1500
+
+
+@dataclass
+class _Ctx:
+    """What a route file inherits from the place that includes it (prefix, middleware, dynamic-prefix flag)."""
+
+    prefix: str = ""
+    mws: list[str] = field(default_factory=list)
+    dynamic: bool = False
+
+    def key(self) -> tuple[str, tuple[str, ...]]:
+        return self.prefix, tuple(self.mws)
+
+
+def _include_target(arg: Any, here: Path, root: Path, backend_dir: Path) -> Path | None:
+    """File named by `base_path('x.php')`, `__DIR__.'/x.php'` or a plain relative string -- only if it exists inside the project."""
+    if arg is None:
+        return None
+    raw = text(arg).strip()
+    rel_path: str | None = None
+    base = backend_dir
+    m = _BASE_PATH.match(raw)
+    if m:
+        rel_path = m.group(1)
+    else:
+        m = _DIR_CONCAT.match(raw)
+        if m:
+            rel_path, base = m.group(1).lstrip("/\\"), here.parent
+        else:
+            v = string_value(arg)
+            if v and v.endswith(".php"):
+                rel_path = v
+    if not rel_path:
+        return None
+    cand = (base / rel_path.lstrip("/\\")).resolve()
+    try:
+        cand.relative_to(root.resolve())  # never read outside the project
+    except ValueError:
+        return None
+    return cand if cand.is_file() and cand.suffix.lower() == ".php" else None
+
+
 def analyze_php(root: Path, backend_dir: Path, outcome: DiscoveryOutcome) -> int:
     files = [
         f for f in iter_source_files(backend_dir, {".php"})
@@ -146,27 +195,65 @@ def analyze_php(root: Path, backend_dir: Path, outcome: DiscoveryOutcome) -> int
     ]
     if not files:
         files = [f for f in iter_source_files(backend_dir, {".php"})]
-    analysed = 0
-    for f in files:
+    counted: set[Path] = set()
+    done: set[tuple[Path, tuple[str, tuple[str, ...]]]] = set()
+    includes = 0
+
+    def scan(f: Path, ctx: _Ctx, depth: int, via: str | None) -> None:
+        nonlocal includes
+        key = (f.resolve(), ctx.key())
+        if key in done or len(done) >= MAX_FILES:
+            return
+        done.add(key)
         src = read_text(f)
-        if "Route::" not in src:
-            continue
-        analysed += 1
+        if "Route::" not in src and "base_path" not in src and "require" not in src and "include" not in src:
+            return
+        counted.add(f.resolve())
         name = rel(f, root)
         tree = parse("php", src)
-        default_prefix = ""
+        default_prefix = ctx.prefix
         warn_extra: list[str] = []
-        parts = f.relative_to(backend_dir).as_posix()
-        if parts.endswith("routes/api.php"):
-            default_prefix = "/api"
+        if via:
+            warn_extra.append(f"included from {via}; prefix/middleware inherited from the including group")
+        parts = f.relative_to(backend_dir).as_posix() if f.is_relative_to(backend_dir) else f.name
+        if via is None and parts.endswith("routes/api.php"):
+            default_prefix = join_paths(ctx.prefix, "/api")
             warn_extra.append("assumed Laravel default '/api' prefix for routes/api.php (RouteServiceProvider/bootstrap may override)")
-        elif parts.endswith("routes/web.php"):
+        elif via is None and parts.endswith("routes/web.php"):
             warn_extra.append("routes/web.php uses the web middleware group (session/CSRF); it may not be an API route")
         handled: set[int] = set()
         for node in walk(tree.root_node):
-            if node.type not in ("member_call_expression", "scoped_call_expression") or node.id in handled:
+            if node.id in handled:
+                continue
+            if node.type in _INCLUDE_NODES:  # require base_path('routes/x.php'); inside the current group
+                child = _include_target(first_of(node, "function_call_expression", "binary_expression", "string", "encapsed_string") or (named_children(node) or [None])[0], f, root, backend_dir)
+                if child is not None and depth < MAX_INCLUDE_DEPTH:
+                    gp, gmw, gd = _group_context(node)
+                    includes += 1
+                    scan(child, _Ctx(join_paths(default_prefix, gp) if (default_prefix or gp) else "", [*ctx.mws, *gmw], ctx.dynamic or gd), depth + 1, name)
+                continue
+            if node.type not in ("member_call_expression", "scoped_call_expression"):
                 continue
             meth = _method_name(node).lower() if _method_name(node) else ""
+            if meth == "group":  # Route::name('x')->group(base_path('a/b/XRoute.php'))
+                items, rooted = _chain(node)
+                args = items[0][1] if items else []
+                if rooted and args and args[0].type not in ("anonymous_function", "arrow_function", "array_creation_expression"):
+                    for inner in walk(node):
+                        if inner is not node and inner.type in ("member_call_expression", "scoped_call_expression"):
+                            handled.add(inner.id)
+                    child = _include_target(args[0], f, root, backend_dir)
+                    if child is None:
+                        outcome.potential_routes.append(PotentialRoute(
+                            description=f"Route::...->group({text(args[0])[:60]})", reason="route file path is not static or does not exist inside the project",
+                            source_file=name, line=line_of(node), strategy="static"))
+                    elif depth < MAX_INCLUDE_DEPTH:
+                        gp, gmw, gd = _group_context(node)
+                        cp, cmw, cd = _modifiers(items[1:] + [])
+                        includes += 1
+                        scan(child, _Ctx(join_paths(default_prefix, gp, cp) if (default_prefix or gp or cp) else "",
+                                         [*ctx.mws, *gmw, *cmw], ctx.dynamic or gd or cd), depth + 1, name)
+                continue
             if meth not in VERBS | {"any", "match", "apiresource", "resource"}:
                 continue
             inner_items, rooted = _chain(node)
@@ -182,13 +269,18 @@ def analyze_php(root: Path, backend_dir: Path, outcome: DiscoveryOutcome) -> int
                 cur = cur.parent
                 outer.append((_method_name(cur), _args(cur)))
             items = list(reversed(outer)) + inner_items
-            _emit_route(node, meth, items, len(outer), name, default_prefix, warn_extra, outcome)
-    return analysed
+            _emit_route(node, meth, items, len(outer), name, default_prefix, warn_extra, outcome, ctx.mws, ctx.dynamic)
+
+    for f in files:
+        scan(f, _Ctx(), 0, None)
+    if includes:
+        outcome.warnings.append(DiscoveryWarning(adapter="laravel-static", message=f"followed {includes} route-file include(s) (->group(base_path(...)) / require); prefix and middleware were inherited from the including group", source_file=None, line=None))
+    return len(counted)
 
 
 def _emit_route(
     node: Any, meth: str, items: list[tuple[str, list[Any]]], verb_idx: int, file: str, default_prefix: str,
-    warn_extra: list[str], outcome: DiscoveryOutcome,
+    warn_extra: list[str], outcome: DiscoveryOutcome, inherited_mws: list[str] | None = None, inherited_dynamic: bool = False,
 ) -> None:
     # items is outermost-first; the verb call may itself be wrapped (e.g. ->name('x') / ->middleware()).
     verb_args = items[verb_idx][1]
@@ -197,7 +289,8 @@ def _emit_route(
     pfx_chain, mw_chain, dyn_chain = _modifiers(chain_inner[1:] + chain_outer)
     gp, gmw, gdyn = _group_context(node)
     prefix = join_paths(default_prefix, gp, pfx_chain) if (default_prefix or gp or pfx_chain) else ""
-    mws = gmw + mw_chain
+    mws = [*(inherited_mws or []), *gmw, *mw_chain]
+    gdyn = gdyn or inherited_dynamic
     requires_auth = True if any(m == "auth" or m.startswith("auth:") or m.startswith("auth.") for m in mws) else None
     schemes = [m for m in mws if m.startswith("auth")]
     warnings = list(warn_extra)

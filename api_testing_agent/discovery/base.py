@@ -19,6 +19,7 @@ class DiscoveryContext:
     spec_path: Path | None = None
     timeout: float = 60.0
     allow_cli: bool = True
+    spec_from_probe: bool = False  # the spec was fetched from the live target (not given by the user): source analysis still cross-checks it
 
     @property
     def backend_dir(self) -> Path:

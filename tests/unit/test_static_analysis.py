@@ -199,3 +199,43 @@ def test_go_gin_groups_and_net_http(tmp_path):
     by, out = discover(tmp_path, files, TreeSitterStaticAdapter())
     assert ("GET", "/api/users/{id}") in by and ("POST", "/api/users") in by and ("GET", "/legacy/{id}") in by
     assert all(e.confidence.value != "high" for e in by.values()), "Go analysis is shallower and must not claim high confidence"
+
+
+def test_laravel_route_files_included_from_a_group_inherit_prefix_and_auth(tmp_path):
+    files = {
+        "composer.json": '{"require": {"laravel/framework": "^10"}}',
+        "artisan": "<?php\n",
+        "routes/api.php": (
+            "<?php\nuse Illuminate\\Support\\Facades\\Route;\n"
+            "Route::post('/auth/login', [AuthController::class, 'login']);\n"
+            "Route::group(['middleware' => ['auth:sanctum', 'throttle:120,1']], function () {\n"
+            "    Route::name('employees')->group(base_path('app/Api/Employee/EmployeeRoute.php'));\n"
+            "    Route::prefix('hr')->group(base_path('app/Api/Hr/HrRoute.php'));\n"
+            "});\n"
+            "Route::group(['prefix' => 'public'], function () { require base_path('app/Api/Open/OpenRoute.php'); });\n"
+            "Route::name('x')->group(base_path('../outside.php'));\n"
+            "Route::name('y')->group($dynamicPath);\n"
+        ),
+        "app/Api/Employee/EmployeeRoute.php": (
+            "<?php\nRoute::get('/employees/list', [EmployeeController::class, 'list']);\n"
+            "Route::group(['middleware' => ['permission:Approve Employee']], function () {\n"
+            "    Route::post('/employees/approval', [EmployeeController::class, 'approve']);\n"
+            "});\n"
+            "Route::delete('/employees/{uuid}', [EmployeeController::class, 'destroy']);\n"
+        ),
+        "app/Api/Hr/HrRoute.php": "<?php\nRoute::get('/staff', [HrController::class, 'index']);\nRoute::name('deep')->group(base_path('app/Api/Hr/DeepRoute.php'));\n",
+        "app/Api/Hr/DeepRoute.php": "<?php\nRoute::get('/deep', [HrController::class, 'deep']);\nRoute::name('loop')->group(base_path('app/Api/Hr/HrRoute.php'));\n",
+        "app/Api/Open/OpenRoute.php": "<?php\nRoute::get('/ping', [OpenController::class, 'ping']);\n",
+        "outside.php": "<?php\nRoute::get('/leak', fn() => 1);\n",
+    }
+    by, out = discover(tmp_path, files, TreeSitterStaticAdapter())
+    assert by[("GET", "/api/employees/list")].requires_auth is True, "auth:sanctum comes from the including group"
+    assert ("POST", "/api/employees/approval") in by and by[("POST", "/api/employees/approval")].requires_auth is True
+    assert ("DELETE", "/api/employees/{uuid}") in by
+    assert ("GET", "/api/hr/staff") in by and ("GET", "/api/hr/deep") in by, "prefix flows through nested includes"
+    assert by[("GET", "/api/public/ping")].requires_auth is None, "an include outside the auth group stays public"
+    assert by[("POST", "/api/auth/login")].requires_auth is None
+    assert not any("leak" in r for _m, r in by), "an include that escapes the project root must never be read"
+    assert any("not static" in p.reason or "does not exist" in p.reason for p in out.potential_routes)
+    assert any("followed" in w.message for w in out.warnings)
+    assert len([k for k in by if k[1] == "/api/hr/staff"]) == 1, "include cycles must not duplicate routes"
