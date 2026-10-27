@@ -269,7 +269,7 @@ def test_login_endpoint_uses_runtime_variables_and_no_token():
     res = assumed_resolution(AuthConfig(method="login"))
     res.login = spec
     gen = generate(inv, GenerationOptions(policy=SafetyPolicy(allow_mutating=True), auth=res))
-    items = {i["name"].split(" [")[0]: i for f in gen.collection["item"] for i in f["item"]}
+    items = {i["name"].split(" [")[0]: i for f in gen.collection["item"] for i in f["item"] if i["name"].endswith("[positive]")}
     login = items["POST /auth/login"]["request"]
     assert json.loads(login["body"]["raw"]) == {"username": "{{auth_username}}", "password": "{{auth_password}}"}
     assert not any(h["key"] == "Authorization" for h in login["header"])

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import platform
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -11,6 +12,7 @@ from typing import Any
 import httpx
 
 from . import __version__
+from .auth.headers import HeaderPlan, detect_header_hints, parse_header_flags, resolve_headers
 from .auth.provider import AuthConfig, AuthProvider, AuthResolution, LoginSpec, build_provider
 from .discovery.base import DiscoveryContext
 from .discovery.registry import run_discovery
@@ -32,7 +34,7 @@ from .reporting.report_generator import build_report, overall_exit, write_report
 from .scanner.repository_scanner import scan_repository, select_backend
 from .security.redaction import redact_text
 from .security.safety_policy import SafetyPolicy, Target, parse_target
-from .test_generation.collection_generator import Fixtures, GenerationOptions, GenerationResult, generate, subset_collection
+from .test_generation.collection_generator import EndpointFixture, Fixtures, GenerationOptions, GenerationResult, generate, subset_collection
 from .utils.filesystem import read_json, write_json
 
 Progress = Callable[[str], None]
@@ -140,7 +142,7 @@ def do_generate(inv: EndpointInventory, out_dir: Path, opts: GenerationOptions, 
 def _relogin_and_retry(
     provider: AuthProvider, auth_res: AuthResolution, gen: GenerationResult, plan: TestPlan, execution: ExecutionResult,
     inv: EndpointInventory, base_url: str, policy: SafetyPolicy, newman: str, out_dir: Path, secrets: list[str],
-    timeout_s: float, progress: Progress,
+    timeout_s: float, progress: Progress, hdr_plan: HeaderPlan | None = None,
 ) -> tuple[int, list[str]]:
     """Requests that were rejected with 401 although a credential was attached usually mean the token expired.
 
@@ -165,6 +167,8 @@ def _relogin_and_retry(
     if not fresh.available:
         return 0, ["re-login produced no credential, first-pass results kept"]
     secrets.extend(s for s in fresh.secrets if s not in secrets)
+    if hdr_plan is not None:
+        fresh.env_vars.update(hdr_plan.env_vars())
     sub_plan = TestPlan(requests=retry)
     res, raw = run_collection(subset_collection(gen.collection, {p.item_id for p in retry}), base_url, fresh.env_vars, policy, newman, out_dir, secrets)
     if raw is None:
@@ -192,6 +196,30 @@ def _preflight(target: Target, timeout_s: float) -> None:
         ) from exc
 
 
+def _suggest_bodies(inv: EndpointInventory, fixtures: Fixtures, auth_res: AuthResolution, policy: SafetyPolicy, allowed: bool, progress: Progress) -> dict[str, Any]:
+    """Static analysis only learns body *field names* (types unknown), so POST/PUT/PATCH bodies are usually rejected as invalid.
+    Ask the LLM for a valid example, from the redacted handler source only. Returns names of the endpoints it filled in."""
+    if not (allowed and policy.allow_mutating):
+        return {}
+    login_id = auth_res.login.endpoint_id if auth_res.login else None
+    todo = [e for e in inv.endpoints
+            if e.method in ("POST", "PUT", "PATCH") and e.request_body is not None and e.id != login_id
+            and f"{e.method} {e.route}" not in fixtures.endpoints
+            and any("inferred" in w or "not established" in w for w in e.warnings)]
+    if not todo:
+        return {}
+    progress(f"Asking the LLM for example request bodies of {len(todo)} endpoint(s) (redacted handler source only) ...")
+    from .auth.llm import suggest_bodies
+
+    bodies, note = suggest_bodies(inv, todo)
+    for key, body in bodies.items():
+        fx = fixtures.endpoints.setdefault(key, EndpointFixture())
+        fx.body, fx.generated = body, True
+    if not bodies:
+        progress(note)
+    return {"endpoints": sorted(bodies), "note": note}
+
+
 def do_test(
     folder: str | Path,
     out_dir: Path,
@@ -209,8 +237,10 @@ def do_test(
     runtime_spec_url: str | None = None,
     discovery_timeout: float = 60.0,
     use_llm: bool | None = None,
+    header_flags: list[str] | None = None,
     progress: Progress = _noop,
 ) -> TestRunOutcome:
+    explicit_headers = parse_header_flags(header_flags)  # fail on a malformed --header before any traffic
     target = parse_target(base_url)
     policy.check_target(target)
     progress(f"Target: {target.base_url} ({target.klass.value}); mutating={policy.allow_mutating} destructive={policy.allow_destructive} negative={policy.allow_negative}")
@@ -245,26 +275,44 @@ def do_test(
     # authentication
     auth_res: AuthResolution = AuthResolution("none", False, "no authentication configured (--auth none)")
     auth_error: str | None = None
-    provider: AuthProvider = build_provider(auth_config, inv, use_llm)
+    # headers every request needs (API key, client version, tenant ...): found in the source, valued from flags / .env / generators
+    llm_allowed = auth_config.use_llm if use_llm is None else use_llm
+    hdr_plan = resolve_headers(detect_header_hints(inv), explicit_headers, auth_config.api_key_env, llm_allowed)
+    if hdr_plan.headers or hdr_plan.unresolved or hdr_plan.unsupported:
+        progress("Request headers: " + ", ".join(f"{h.name} ({h.source})" for h in hdr_plan.headers)
+                 + (f"; MISSING: {', '.join(h.name for h in hdr_plan.unresolved)}" if hdr_plan.unresolved else "")
+                 + (f"; unsupported (signature): {', '.join(hdr_plan.unsupported)}" if hdr_plan.unsupported else ""))
+    if hdr_plan.unresolved:
+        progress(hdr_plan.hint_for_missing())
+    provider: AuthProvider = build_provider(auth_config, inv, use_llm, policy.delay_ms)
+    provider.header_plan = hdr_plan
     if connectivity_error is None and auth_config.method != "none":
         progress(f"Resolving authentication ({auth_config.method}) ...")
         try:
             auth_res = provider.resolve(target.base_url, policy.request_timeout_ms / 1000)
         except AuthenticationError as exc:
-            auth_error = str(exc)
-            auth_res = AuthResolution(auth_config.method, False, f"authentication failed: {exc}")
-            exit_override = exit_override or exc.exit_code
+            # Login is the first thing that must work: without it nothing else is meaningful, so stop here -- before any LLM
+            # call, collection generation or Newman run -- and say exactly why.
+            msg = redact_text(str(exc), [*hdr_plan.secrets(), os.environ.get(auth_config.password_env, "")])
+            raise AuthenticationError(f"login failed, nothing was tested: {msg}") from exc
     elif auth_config.method != "none":
         auth_res = AuthResolution(auth_config.method, False, "not attempted: target unreachable")
+    auth_res.env_vars.update(hdr_plan.env_vars())  # header values reach Newman through the private runtime environment only
+    auth_res.secrets = [*auth_res.secrets, *hdr_plan.secrets()]
     secrets = list(auth_res.secrets)
+    meta["headers"] = {"headers": hdr_plan.summary(), "notes": hdr_plan.notes, "llm_used": hdr_plan.llm_used}
     meta["auth"] = {
         "method": auth_config.method, "credentials_available": auth_res.available, "reason": auth_res.reason, "notes": auth_res.notes,
         "login_endpoint": auth_res.login.path if auth_res.login else None,
         "login_detected_by": auth_res.login.source if auth_res.login else None,
-        "llm_used": auth_res.llm_used, "relogins": 0,
+        "llm_used": auth_res.llm_used or hdr_plan.llm_used, "relogins": 0, "login_requests": auth_res.login_requests,
+        "request_headers": hdr_plan.summary(),  # names and provenance only, never values
     }
+    meta["auth"]["notes"] = [*meta["auth"]["notes"], *hdr_plan.notes]
 
-    gen = do_generate(inv, out_dir, GenerationOptions(policy=policy, auth=auth_res, fixtures=Fixtures.load(fixtures_path), seed=seed), progress)
+    fixtures = Fixtures.load(fixtures_path)
+    meta["llm_bodies"] = _suggest_bodies(inv, fixtures, auth_res, policy, llm_allowed, progress)
+    gen = do_generate(inv, out_dir, GenerationOptions(policy=policy, auth=auth_res, fixtures=fixtures, seed=seed, headers=hdr_plan), progress)
     plan = gen.plan
 
     versions: dict[str, str | None] = {"api_testing_agent": __version__, "python": platform.python_version(), "node": None, "newman": None}
@@ -291,9 +339,10 @@ def do_test(
                 execution.newman_version = tv.newman
                 if auth_res.available and auth_res.relogin_supported:
                     retried, notes = _relogin_and_retry(provider, auth_res, gen, plan, execution, inv, target.base_url, policy,
-                                                        newman, out_dir, secrets, policy.request_timeout_ms / 1000, progress)
+                                                        newman, out_dir, secrets, policy.request_timeout_ms / 1000, progress, hdr_plan)
                     meta["auth"]["relogins"] = 1 if retried else 0
                     meta["auth"]["retried_requests"] = retried
+                    meta["auth"]["login_requests"] = getattr(provider, "login_requests", meta["auth"]["login_requests"])
                     meta["auth"]["notes"] = [*meta["auth"]["notes"], *notes]
             execution.newman_exit_code = res.returncode
             execution.log_excerpt = log_excerpt(res, secrets)

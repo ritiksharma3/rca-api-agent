@@ -24,8 +24,10 @@ from pydantic import BaseModel
 
 from ..errors import AuthenticationError
 from ..security.redaction import redact_text
+from .headers import ENV_PREFIX
 
 if TYPE_CHECKING:  # pragma: no cover
+    from .headers import HeaderPlan
     from ..models.endpoint import EndpointInventory
 
 AuthMethod = Literal["none", "bearer", "login", "api-key", "basic", "session"]
@@ -89,10 +91,14 @@ class AuthResolution:
     login: LoginSpec | None = None  # the login that worked (login/session only)
     relogin_supported: bool = False  # a fresh credential can be obtained by calling the provider again
     llm_used: bool = False
+    login_requests: int = 0  # login POSTs sent so far (they count against the request budget)
+    refresh_available: bool = False  # the login response also returned a refresh token (kept in env var auth_refresh_token)
 
 
 class AuthProvider(ABC):
     name = ""
+
+    header_plan: "HeaderPlan | None" = None  # headers every request needs (API key, client version ...), set by the pipeline
 
     def __init__(self, config: AuthConfig):
         self.config = config
@@ -130,19 +136,93 @@ def _clean_token(value: str) -> str:
     return v.split(None, 1)[1] if v.lower().startswith("bearer ") and len(v.split(None, 1)) == 2 else v
 
 
-def _extract_token(resp: httpx.Response, body: Any, token_path: str | None) -> str | None:
-    """Pull the credential out of a login response. An explicit path is strict; otherwise common locations are scanned."""
-    paths = (token_path,) if token_path else TOKEN_PATHS
-    for p in paths:
+def _find_token(resp: httpx.Response, body: Any, token_path: str | None) -> tuple[str, str] | None:
+    """Locate the credential in a login response -> (token, where). A configured path is tried first, but it is only a
+    preference: servers name and nest tokens differently (and a saved path can go stale), so the response is scanned if it misses."""
+    for p in ((token_path,) if token_path else ()) + TOKEN_PATHS:
         value = resp.headers.get(p[7:]) if p.lower().startswith("header:") else _dig(body, p)
         if isinstance(value, str) and len(_clean_token(value)) >= 8:
-            return _clean_token(value)
-    if token_path is None and isinstance(body, dict):  # last resort: any top-level / data.* key that looks like a token
-        for scope in (body, body.get("data") if isinstance(body.get("data"), dict) else {}):
-            for k, v in scope.items():
-                if "token" in k.lower() and "refresh" not in k.lower() and isinstance(v, str) and len(v) >= 8:
-                    return v
+            return _clean_token(value), p
+    if isinstance(body, (dict, list)):  # last resort: scan the whole response for something token-shaped
+        return _scan_for_token(body)
     return None
+
+
+def _extract_token(resp: httpx.Response, body: Any, token_path: str | None) -> str | None:
+    found = _find_token(resp, body, token_path)
+    return found[0] if found else None
+
+
+_JWT_SHAPE = re.compile(r"^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$")
+_HEADER_PROBLEM = re.compile(r"api[\s_-]?key|header|client[\s_-]?version|tenant|x-[a-z]", re.I)
+MAX_SCAN_DEPTH = 4
+
+
+def _scan_for_token(body: Any) -> tuple[str, str] | None:
+    """The most token-looking string in the response that is not a refresh token -> (token, dotted path)."""
+    jwt_like: list[tuple[str, str]] = []
+    named: list[tuple[str, str]] = []
+
+    def walk(node: Any, key: str, path: str, depth: int) -> None:
+        if depth > MAX_SCAN_DEPTH:
+            return
+        if isinstance(node, dict):
+            for k, v in node.items():
+                walk(v, str(k), f"{path}.{k}" if path else str(k), depth + 1)
+        elif isinstance(node, list):
+            for v in node[:5]:
+                walk(v, key, path, depth + 1)
+        elif isinstance(node, str) and "refresh" not in key.lower():
+            if _JWT_SHAPE.match(node):
+                jwt_like.append((node, path))
+            elif len(node) >= 8 and re.search(r"token|jwt|bearer", key, re.I) and not re.search(r"type|expires", key, re.I):
+                named.append((node, path))
+
+    walk(body, "", "", 0)
+    return (jwt_like or named or [None])[0]
+
+
+def _find_refresh_token(body: Any) -> str | None:
+    """A refresh token returned next to the access token, so `POST /auth/refresh`-style endpoints can be tested with a real one."""
+    def walk(node: Any, depth: int) -> str | None:
+        if depth > MAX_SCAN_DEPTH or not isinstance(node, dict):
+            return None
+        for k, v in node.items():
+            if isinstance(v, str) and len(v) >= 8 and re.fullmatch(r"(?i)refresh[-_]?token", str(k)):
+                return v
+        for v in node.values():
+            found = walk(v, depth + 1)
+            if found:
+                return found
+        return None
+
+    return walk(body, 0)
+
+
+def _scheme(body: Any, default: str) -> str:
+    """Authorization scheme: what the server says (``tokenType`` / ``token_type``) else the configured default."""
+    if isinstance(body, dict):
+        for k in ("tokenType", "token_type"):
+            v = body.get(k)
+            if isinstance(v, str) and re.fullmatch(r"[A-Za-z]{3,20}", v):
+                return v.capitalize() if v.lower() == "bearer" else v
+    return default
+
+
+def _error_detail(resp: httpx.Response, secrets: list[str]) -> str:
+    """Short, redacted description of an error response ({"error": {"code": ..., "message": ...}} and common variants)."""
+    try:
+        body = resp.json()
+    except ValueError:
+        return ""
+    err = body.get("error", body) if isinstance(body, dict) else None
+    if isinstance(err, str):
+        text = err
+    elif isinstance(err, dict):
+        text = " - ".join(str(err[k]) for k in ("code", "error", "message", "detail") if isinstance(err.get(k), (str, int)))
+    else:
+        text = ""
+    return redact_text(text, secrets)[:160]
 
 
 class NoAuthProvider(AuthProvider):
@@ -210,13 +290,17 @@ class LoginProvider(AuthProvider):
     name = "login"
     cookie_mode = False
 
-    def __init__(self, config: AuthConfig, inventory: "EndpointInventory | None" = None, use_llm: bool | None = None):
+    def __init__(self, config: AuthConfig, inventory: "EndpointInventory | None" = None, use_llm: bool | None = None,
+                 delay_ms: int = 0):
         super().__init__(config)
         self.inventory = inventory
         self.use_llm = config.use_llm if use_llm is None else use_llm
+        self.delay_s = max(delay_ms, 0) / 1000  # same pacing as test traffic (--delay-ms)
+        self.login_requests = 0  # every login POST this provider sent, across resolve() calls
         self.spec: LoginSpec | None = None  # the spec that worked
         self.llm_used = False
         self._cookie_fallback: tuple[LoginSpec, str, list[str]] | None = None  # (spec, Cookie header, secrets)
+        self._token_llm_tried = False
 
     # ------------------------------------------------------------------ candidates
     @staticmethod
@@ -249,20 +333,28 @@ class LoginProvider(AuthProvider):
     def _attempt(self, spec: LoginSpec, base_url: str, user: str, pwd: str, timeout_s: float, secrets: list[str]) -> AuthResolution:
         url = self._login_url(base_url, spec.path)
         payload = {spec.username_field: user, spec.password_field: pwd}
+        headers = self.header_plan.probe_headers() if self.header_plan else {}
+        if self.login_requests and self.delay_s:
+            time.sleep(self.delay_s)
+        self.login_requests += 1
         try:
             with httpx.Client(timeout=timeout_s, follow_redirects=False, verify=True) as client:
-                resp = client.post(url, **({"data": payload} if spec.content_type == "form" else {"json": payload}))
+                resp = client.post(url, headers=headers, **({"data": payload} if spec.content_type == "form" else {"json": payload}))
                 cookies = [(c.name, c.value) for c in client.cookies.jar]
         except httpx.HTTPError as exc:
             raise AuthenticationError(f"login request failed: {redact_text(type(exc).__name__ + ': ' + str(exc), secrets)}") from exc
         if resp.is_redirect:
             raise AuthenticationError("login endpoint redirected; redirects are not followed for safety")
-        if resp.status_code in (401, 403):
-            err = AuthenticationError(f"login endpoint {spec.path} rejected the credentials (HTTP {resp.status_code})")
-            err.credentials_rejected = True  # type: ignore[attr-defined]
-            raise err
         if resp.status_code >= 400:
-            raise AuthenticationError(f"login endpoint {spec.path} returned HTTP {resp.status_code}")
+            detail = _error_detail(resp, [*secrets, *headers.values()])
+            header_problem = bool(_HEADER_PROBLEM.search(detail))
+            if resp.status_code in (401, 403) and not header_problem:
+                err = AuthenticationError(f"login endpoint {spec.path} rejected the credentials (HTTP {resp.status_code}{detail and ': ' + detail})")
+                err.credentials_rejected = True  # type: ignore[attr-defined]
+                raise err
+            hint = ("; a required request header is probably missing or wrong -- supply it with --header NAME=VALUE or "
+                    f"{ENV_PREFIX}<NAME> in .env" if header_problem else "")
+            raise AuthenticationError(f"login endpoint {spec.path} returned HTTP {resp.status_code}{detail and ': ' + detail}{hint}")
         try:
             body: Any = resp.json()
         except ValueError:
@@ -275,24 +367,40 @@ class LoginProvider(AuthProvider):
                 raise AuthenticationError(f"login at {spec.path} set no session cookie")
             return self._cookie_resolution(spec, user, pwd, secrets, cookie_header, cookie_secrets)
 
-        token = _extract_token(resp, body, spec.token_path)
+        found = _find_token(resp, body, spec.token_path)
+        token = found[0] if found else None
+        if found:
+            spec.token_path = found[1]
+        if not token and body is not None and not self.cookie_mode and self.use_llm and not spec.token_path and not self._token_llm_tried:
+            self._token_llm_tried = True
+            from .llm import suggest_token_path
+
+            path, _note = suggest_token_path(body)  # only the masked shape of the response is sent
+            token = _extract_token(resp, body, path) if path else None
+            if token:
+                spec.token_path, self.llm_used = path, True
         if token:
             return self._token_resolution(spec, user, pwd, secrets, token, body)
         if cookie_header:  # token-less login that set a session: usable only if no candidate yields a token
             self._cookie_fallback = (spec, cookie_header, cookie_secrets)
         if body is None and not cookie_header:
             raise AuthenticationError("login response is not valid JSON")
-        where = f"'{spec.token_path}'" if spec.token_path else "any common location"
-        raise AuthenticationError(f"login response has no usable string token at {where} (check --login-token-path)")
+        keys = ", ".join(sorted(body)[:12]) if isinstance(body, dict) else type(body).__name__
+        raise AuthenticationError(f"login response has no usable token (response keys: {keys}); pass --login-token-path if it is unusual")
 
     def _token_resolution(self, spec: LoginSpec, user: str, pwd: str, secrets: list[str], token: str, body: Any) -> AuthResolution:
         secrets = [*secrets, token]
         res = AuthResolution(
             self.name, True, env_vars={"auth_token": token, "auth_username": user, "auth_password": pwd}, secrets=secrets,
-            header_name="Authorization", header_value_template=f"{self.config.header_scheme} {{{{auth_token}}}}",
+            header_name="Authorization", header_value_template=f"{_scheme(body, self.config.header_scheme)} {{{{auth_token}}}}",
             login=spec, relogin_supported=True, llm_used=self.llm_used,
         )
-        expires = body.get("expires_in") if isinstance(body, dict) else None
+        refresh = _find_refresh_token(body)
+        if refresh:
+            res.env_vars["auth_refresh_token"] = refresh
+            res.secrets.append(refresh)
+            res.refresh_available = True
+        expires = next((body[k] for k in ("expires_in", "expiresIn") if isinstance(body, dict) and isinstance(body.get(k), (int, float))), None)
         if not isinstance(expires, (int, float)):
             exp = _jwt_exp(token)
             expires = exp - time.time() if exp else None
@@ -312,6 +420,11 @@ class LoginProvider(AuthProvider):
 
     # ------------------------------------------------------------------ resolve
     def resolve(self, base_url: str, timeout_s: float = 10.0) -> AuthResolution:
+        res = self._resolve(base_url, timeout_s)
+        res.login_requests = self.login_requests
+        return res
+
+    def _resolve(self, base_url: str, timeout_s: float) -> AuthResolution:
         user = os.environ.get(self.config.username_env, "")
         pwd = os.environ.get(self.config.password_env, "")
         if not user or not pwd:
@@ -372,7 +485,7 @@ def assumed_resolution(config: AuthConfig) -> AuthResolution:
     m = config.method
     if m == "none":
         return AuthResolution("none", False, "no auth configured")
-    res = AuthResolution(m, True)
+    res = AuthResolution(m, True, refresh_available=m in ("login", "session"))
     if m in ("bearer", "login"):
         res.header_name, res.header_value_template = "Authorization", f"{config.header_scheme} {{{{auth_token}}}}"
     elif m == "basic":
@@ -384,11 +497,12 @@ def assumed_resolution(config: AuthConfig) -> AuthResolution:
     return res
 
 
-def build_provider(config: AuthConfig, inventory: "EndpointInventory | None" = None, use_llm: bool | None = None) -> AuthProvider:
+def build_provider(config: AuthConfig, inventory: "EndpointInventory | None" = None, use_llm: bool | None = None,
+                   delay_ms: int = 0) -> AuthProvider:
     if config.method == "login":
-        return LoginProvider(config, inventory, use_llm)
+        return LoginProvider(config, inventory, use_llm, delay_ms)
     if config.method == "session":
-        return SessionProvider(config, inventory, use_llm)
+        return SessionProvider(config, inventory, use_llm, delay_ms)
     providers: dict[str, type[AuthProvider]] = {
         "none": NoAuthProvider, "bearer": BearerProvider, "api-key": ApiKeyProvider, "basic": BasicProvider,
     }

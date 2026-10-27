@@ -54,6 +54,7 @@ def test_auto_login_detects_endpoint_and_tests_protected_routes(tmp_path):
     assert v[("POST", "/auth/login")]["test_status"] == "PASS"
     auth = rep["authentication"]
     assert (auth["login_endpoint"], auth["login_detected_by"], auth["relogins"]) == ("/auth/login", "heuristic", 0)
+    assert auth["login_requests"] == 1
     assert rep["status_counts"]["BLOCKED"] == 0 and rep["status_counts"]["FAIL"] == 0
     saved = yaml.safe_load((out / ".api-agent.yaml").read_text())
     assert saved["auth"]["login_path"] == "/auth/login" and "admin123" not in json.dumps(saved)
@@ -67,6 +68,7 @@ def test_expired_token_triggers_one_relogin_and_endpoints_recover(tmp_path):
     assert res.exit_code == 0, res.output
     auth = rep["authentication"]
     assert auth["relogins"] == 1 and auth["retried_requests"] >= 1
+    assert auth["login_requests"] >= 2  # initial login + re-login are both counted
     v = verdicts(rep)
     assert all(v[("GET", f"/secure/{c}")]["test_status"] == "PASS" for c in "abcd")
     assert rep["status_counts"]["FAIL"] == 0
@@ -78,15 +80,16 @@ def test_wrong_password_exits_6_and_never_leaks(tmp_path):
         out = tmp_path / "out"
         res, rep = run(FIXTURES / "auth_api", out, url, "--auth", "login", "--allow-mutating", env={"API_AGENT_PASSWORD": "wrong-pass-1"})
     assert res.exit_code == 6, res.output
-    assert any("authentication" in b for b in rep["blockers"])
+    assert rep is None and "login failed, nothing was tested" in res.output, "a failed login stops the run before anything is generated or sent"
+    assert "wrong-pass-1" not in res.output
     assert_no_leaks(out, "wrong-pass-1")
 
 
 def test_no_login_endpoint_and_no_flag_is_a_clear_error(tmp_path, sample_api_dir, sample_server):
     out = tmp_path / "out"
     res, rep = run(sample_api_dir, out, sample_server, "--auth", "login")
-    assert res.exit_code == 6
-    assert any("--login-path" in b for b in rep["blockers"])
+    assert res.exit_code == 6 and rep is None
+    assert "--login-path" in res.output
 
 
 def test_explicit_flags_still_work(tmp_path):

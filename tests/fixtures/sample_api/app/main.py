@@ -3,7 +3,7 @@
 Route behaviour (see tests/integration):
   GET  /health            passes
   GET  /items             passes (query: limit)
-  GET  /items/{item_id}   needs a fixture value for item_id (otherwise BLOCKED)
+  GET  /items/{item_id}   id taken from the GET /items response (a fixture value overrides it)
   POST /items             mutating; validates body
   GET  /users/me          requires a bearer token (token: demo-token)
   GET  /stats             documented schema {total:int} but returns {"total": "oops"}  -> FAIL

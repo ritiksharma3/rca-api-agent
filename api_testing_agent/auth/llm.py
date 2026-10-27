@@ -132,3 +132,134 @@ def suggest_login(inv: EndpointInventory | None, config: AuthConfig, timeout_s: 
     if spec is None:
         return LLMResult(note=f"LLM ({model}) did not identify a usable login endpoint")
     return LLMResult(specs=[spec], note=f"LLM ({model}) suggested {spec.path}")
+
+
+# ---------------------------------------------------------------------------------------------- shared small helpers
+def _complete(system: str, user: str, max_tokens: int, timeout_s: float = 30.0) -> tuple[str | None, str]:
+    """One chat completion. Returns (text, note); never raises."""
+    key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if not key:
+        return None, "LLM assist skipped: OPENROUTER_API_KEY not set"
+    model = os.environ.get("OPENROUTER_MODEL", "").strip() or DEFAULT_MODEL
+    payload = {"model": model, "temperature": 0, "max_tokens": max_tokens,
+               "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+    try:
+        resp = httpx.post(OPENROUTER_URL, headers={"Authorization": f"Bearer {key}"}, json=payload, timeout=timeout_s, follow_redirects=False)
+        resp.raise_for_status()
+        text = resp.json()["choices"][0]["message"]["content"]
+    except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as exc:
+        return None, f"LLM assist failed: {redact_text(type(exc).__name__, [key])}"
+    return (text if isinstance(text, str) else None), f"LLM ({model})"
+
+
+HEADER_PROMPT = (
+    "You help an API test tool send valid requests. For each HTTP header below you get the few lines of backend source that "
+    "read or validate it. Reply with ONLY a JSON object {\"values\": {\"Header-Name\": \"example\"}} giving one realistic value "
+    "that would pass that validation (match any regex, prefix or format shown). Use only letters, digits and . _ : / + = -. "
+    "Omit a header when you cannot tell. Never invent secrets, keys or tokens."
+)
+
+
+def suggest_header_values(hints: list) -> tuple[dict[str, str], str]:
+    """Example values for non-secret request headers from short, redacted source snippets. Names/snippets only leave the machine."""
+    from .headers import value_is_acceptable
+
+    parts = []
+    for h in hints[:12]:
+        parts.append(f"### {h.name}\n{h.snippet}")
+    text, note = _complete(HEADER_PROMPT, "\n\n".join(parts), 400)
+    if text is None:
+        return {}, note
+    obj = parse_reply(text)
+    values = obj.get("values") if isinstance(obj, dict) else None
+    allowed = {h.name for h in hints}
+    out = {k: v for k, v in (values or {}).items() if k in allowed and value_is_acceptable(v)} if isinstance(values, dict) else {}
+    return out, note
+
+
+TOKEN_PROMPT = (
+    "An API test tool logged in and needs to find the credential in the JSON response. Below is the response SHAPE: every "
+    "string value was replaced by <str:LENGTH>. Reply with ONLY a JSON object {\"token_path\": \"dotted.path\"} naming the key "
+    "that holds the access/bearer token (not the refresh token, not an id). Use {\"token_path\": null} if there is none."
+)
+
+
+def mask_shape(obj: object, depth: int = 0) -> object:
+    """JSON structure with every scalar value masked, so no token, id or personal data is ever sent."""
+    if depth > 5:
+        return "<deep>"
+    if isinstance(obj, dict):
+        return {str(k)[:40]: mask_shape(v, depth + 1) for k, v in list(obj.items())[:25]}
+    if isinstance(obj, list):
+        return [mask_shape(obj[0], depth + 1)] if obj else []
+    if isinstance(obj, str):
+        return f"<str:{len(obj)}>"
+    if isinstance(obj, bool):
+        return "<bool>"
+    if isinstance(obj, (int, float)):
+        return "<num>"
+    return None
+
+
+def suggest_token_path(body: object) -> tuple[str | None, str]:
+    """Ask which key of the login response holds the token. Only the masked shape is sent. Verified by the caller."""
+    text, note = _complete(TOKEN_PROMPT, json.dumps(mask_shape(body), separators=(",", ":")), 100)
+    if text is None:
+        return None, note
+    obj = parse_reply(text)
+    path = obj.get("token_path") if isinstance(obj, dict) else None
+    return (path if isinstance(path, str) and _FIELD_OK.match(path) else None), note
+
+
+BODY_PROMPT = (
+    "You help an API test tool build valid requests. For each endpoint below you get the backend handler source. "
+    "Reply with ONLY a JSON object {\"bodies\": {\"METHOD /route\": {...}}} holding one example JSON request body per endpoint that "
+    "satisfies the handler's validation (required fields, types, formats, non-empty arrays). Use realistic values. When a field "
+    "refers to another existing record, use the id 1. Never include real credentials: use the placeholder Passw0rd! for passwords. "
+    "Omit an endpoint when it takes no JSON body or you cannot tell. Use EXACTLY the key from each '###' heading as the JSON key, "
+    "even if comments in the source mention a different route."
+)
+MAX_BODY_ENDPOINTS = 12
+MAX_BODY_CHARS = 2000
+
+
+def _body_ok(obj: object, depth: int = 0) -> bool:
+    if depth > 4:
+        return False
+    if isinstance(obj, dict):
+        return len(obj) <= 30 and all(isinstance(k, str) and len(k) <= 60 and _body_ok(v, depth + 1) for k, v in obj.items())
+    if isinstance(obj, list):
+        return len(obj) <= 10 and all(_body_ok(v, depth + 1) for v in obj)
+    if isinstance(obj, str):
+        return len(obj) <= 200 and "{{" not in obj  # never let a suggestion smuggle in template variables
+    return obj is None or isinstance(obj, (bool, int, float))
+
+
+def _ask_bodies(parts: dict[str, str]) -> tuple[dict[str, object], str | None, str]:
+    text, note = _complete(BODY_PROMPT, "\n\n".join(parts.values()), 1200, timeout_s=60.0)
+    if text is None:
+        return {}, None, note
+    obj = parse_reply(text)
+    bodies = obj.get("bodies") if isinstance(obj, dict) else None
+    good = {k: v for k, v in bodies.items() if isinstance(v, dict) and v and _body_ok(v) and len(json.dumps(v)) <= MAX_BODY_CHARS} if isinstance(bodies, dict) else {}
+    ok = {k: v for k, v in good.items() if k in parts}
+    if not ok and len(parts) == 1 and len(good) == 1:  # one endpoint asked, one body given under a key copied from a source comment
+        ok = {next(iter(parts)): next(iter(good.values()))}
+    return ok, text, note
+
+
+def suggest_bodies(inv: EndpointInventory, endpoints: list[Endpoint]) -> tuple[dict[str, object], str]:
+    """Example request bodies for endpoints whose body could only be inferred from field names. Redacted handler snippets are sent."""
+    parts: dict[str, str] = {}
+    for ep in endpoints[:MAX_BODY_ENDPOINTS]:
+        snip = _snippet(ep, inv)
+        if snip:
+            parts[f"{ep.method} {ep.route}"] = f"### {ep.method} {ep.route}\n{snip}"
+    if not parts:
+        return {}, "LLM body assist skipped: no handler source available"
+    out, _text, note = _ask_bodies(parts)
+    missing = {k: v for k, v in parts.items() if k not in out}
+    if missing and _text is not None:  # models sometimes skip look-alike handlers: ask once more for just those
+        more, _t, _n = _ask_bodies(missing)
+        out.update(more)
+    return out, note

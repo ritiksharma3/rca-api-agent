@@ -13,6 +13,7 @@ from . import __version__
 from .auth.provider import AuthConfig
 from .config import ProjectConfig
 from .discovery.registry import STRATEGIES
+from .envfile import load_env_file
 from .errors import (
     EXIT_INTERNAL,
     EXIT_OK,
@@ -81,8 +82,16 @@ def _version_cb(value: bool) -> None:
 
 
 @app.callback()
-def main(version: Annotated[bool, typer.Option("--version", help="Show version and exit.", callback=_version_cb, is_eager=True)] = False) -> None:
-    pass
+@guarded
+def main(
+    version: Annotated[bool, typer.Option("--version", help="Show version and exit.", callback=_version_cb, is_eager=True)] = False,
+    env_file: Annotated[Optional[Path], typer.Option("--env-file", help="Load credentials/settings from this .env file (default: ./.env). "
+                                                     "Variables already in the environment win; placeholder values such as 'replace-me' are ignored.")] = None,
+) -> None:
+    loaded = load_env_file(env_file)
+    if loaded.loaded or loaded.placeholders:  # names only, never values
+        _say(f"{loaded.path.name}: loaded {', '.join(loaded.loaded) or 'nothing'}"
+             + (f"; ignored placeholder value(s) for {', '.join(loaded.placeholders)}" if loaded.placeholders else ""))
 
 
 # ------------------------------------------------------------------------------------------------ scan
@@ -266,11 +275,15 @@ def test(
     login_content_type: Annotated[Optional[str], typer.Option(help="json | form. Default: taken from the detected login endpoint (json).")] = None,
     no_llm: Annotated[bool, typer.Option(help="Never use the OpenRouter LLM assist to find the login endpoint (it needs OPENROUTER_API_KEY and sends route/field names and short redacted handler snippets, never credentials).")] = False,
     prompt_credentials: Annotated[bool, typer.Option(help="Prompt (hidden) for missing credentials.")] = False,
+    header: Annotated[Optional[list[str]], typer.Option("--header", "-H", help="Header sent on every request, NAME=VALUE or NAME=env:VAR (repeatable). "
+                                                         "Headers the backend source reads (X-API-Key, X-Client-Version, X-Tenant-ID, Idempotency-Key ...) are found "
+                                                         "automatically; give values here or as API_AGENT_HEADER_<NAME> in .env.")] = None,
     fixtures: Annotated[Optional[Path], typer.Option(help="YAML test data for pre-existing resources.")] = None,
     seed: Annotated[Optional[int], typer.Option(help="Random seed for reproducible test data.")] = None,
 ) -> None:
     """Discover, generate, execute through Newman and write the QA report. Requires --base-url and --approve-target."""
     cfg = ProjectConfig.load(output)
+    saved_use_llm = cfg.auth.use_llm  # --no-llm applies to this run only; it must not silently stick
     cfg = _discovery_args(cfg, backend, framework, strategy, spec, runtime_spec_url).merged({
         "base_url": base_url or None, "max_requests": max_requests, "delay_ms": delay_ms,
         "request_timeout_ms": request_timeout, "process_timeout_s": process_timeout, "seed": seed,
@@ -299,7 +312,7 @@ def test(
     outcome = do_test(
         folder, output, cfg.base_url, policy, cfg.auth, fixtures_path=Path(cfg.fixtures) if cfg.fixtures else None,
         seed=cfg.seed, backend=cfg.backend, framework=cfg.framework, strategy=cfg.strategy, spec=cfg.spec,
-        allow_cli=cli_discovery, runtime_spec_url=cfg.runtime_spec_url, use_llm=cfg.auth.use_llm, progress=_say,
+        allow_cli=cli_discovery, runtime_spec_url=cfg.runtime_spec_url, use_llm=cfg.auth.use_llm, header_flags=header, progress=_say,
     )
     if outcome.login_spec is not None:  # remember what worked (non-secret) so the next run skips detection
         ls = outcome.login_spec
@@ -308,6 +321,7 @@ def test(
         cfg.auth.login_token_path = ls.token_path or cfg.auth.login_token_path
     if approved and target.origin not in cfg.approved_targets:
         cfg.approved_targets.append(target.origin)
+    cfg.auth.use_llm = saved_use_llm
     cfg.save(output)  # only non-secret settings; risky permissions are never persisted
     r = outcome.report
     typer.echo("")

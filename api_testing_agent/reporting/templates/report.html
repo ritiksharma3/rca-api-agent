@@ -123,6 +123,7 @@
     {% if r.authentication.login_endpoint %}<tr><th>Login endpoint</th><td class="mono">{{ r.authentication.login_endpoint }} (found by {{ r.authentication.login_detected_by }}{{ ', LLM-assisted' if r.authentication.llm_used }})</td></tr>{% endif %}
     <tr><th>Re-logins</th><td>{{ r.authentication.relogins or 0 }}{% if r.authentication.retried_requests %} ({{ r.authentication.retried_requests }} request(s) retried after a 401){% endif %}</td></tr>
     {% for n in r.authentication.notes %}<tr><th>Note</th><td>{{ n }}</td></tr>{% endfor %}
+    {% for h in r.authentication.request_headers or [] %}<tr><th>Header</th><td class="mono">{{ h.name }}: {{ h.status }}{% if h.source %} (from {{ h.source }}){% endif %}{% if h.found_in %} &mdash; read at {{ h.found_in }}{% endif %}</td></tr>{% endfor %}
   </table>
   {% endif %}
 

@@ -57,9 +57,15 @@ def check_dependencies(project_dir: Path | None = None) -> tuple[str, ToolVersio
     if newman is None:
         raise MissingDependencyError("Newman was not found.\n" + INSTALL_HELP)
     nv = tool_version("node")
-    ver = tool_version(newman)
+    # Newman's first start can be slow on Windows (antivirus scan, cold npm cache), so allow a long timeout and one retry.
+    probe = run_command([newman, "--version"], timeout=60)
+    if not probe.ok:
+        probe = run_command([newman, "--version"], timeout=60)
+    text = (probe.stdout or probe.stderr).strip()
+    ver = text.splitlines()[0] if probe.ok and text else None
     if ver is None:
-        raise MissingDependencyError(f"Newman at {newman} could not report a version.\n" + INSTALL_HELP)
+        why = "timed out after 60s" if probe.timed_out else redact_text(truncate((probe.stderr or probe.stdout or "no output").strip(), 300))
+        raise MissingDependencyError(f"Newman at {newman} could not report a version ({why}).\n" + INSTALL_HELP)
     return newman, ToolVersions(platform.python_version(), nv, ver)
 
 

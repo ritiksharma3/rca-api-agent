@@ -11,6 +11,8 @@ from pathlib import Path
 import httpx
 import pytest
 
+os.environ["API_AGENT_ENV_FILE"] = ""  # tests must never pick up the developer's real ./.env (credentials)
+
 ROOT = Path(__file__).resolve().parents[1]
 SAMPLE_API = ROOT / "tests" / "fixtures" / "sample_api"
 

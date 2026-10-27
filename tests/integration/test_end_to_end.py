@@ -72,7 +72,8 @@ def test_blocked_by_missing_fixture_auth_and_policy_but_still_discovered(tmp_pat
     res, rep = run(sample_api_dir, tmp_path / "out", sample_server)
     v = verdicts(rep)
     item = v[("GET", "/items/{item_id}")]
-    assert item["test_status"] == "BLOCKED" and "MISSING_FIXTURE" in item["reason"]
+    assert item["test_status"] == "PASS", "no fixture needed: the id comes from the GET /items response (read-only, never modified)"
+    assert ("DELETE", "/items/{item_id}") not in v or v[("DELETE", "/items/{item_id}")]["test_status"] == "BLOCKED"
     me = v[("GET", "/users/me")]
     assert me["test_status"] == "BLOCKED" and "MISSING_AUTH" in me["reason"]
     assert {s["scenario"]: s["status"] for s in me["scenarios"]}["auth_required"] == "PASS", "the unauthenticated check needs no credentials"
@@ -97,9 +98,8 @@ def test_wrong_credentials_exit_6_with_blocked_not_pass(tmp_path, sample_api_dir
     res, rep = run(sample_api_dir, tmp_path / "out", sample_server, "--auth", "login", "--login-path", "/does-not-exist",
                    env={"API_AGENT_USERNAME": "qa", "API_AGENT_PASSWORD": "pa55word!"})
     assert res.exit_code == 6, res.output
-    assert "pa55word!" not in res.output and "pa55word!" not in json.dumps(rep)
-    assert verdicts(rep)[("GET", "/users/me")]["test_status"] == "BLOCKED"
-    assert any("authentication" in b.lower() for b in rep["blockers"])
+    assert "pa55word!" not in res.output
+    assert rep is None and "nothing was tested" in res.output  # no all-blocked report: the run stops at the failed login
 
 
 def test_collection_that_cannot_execute_is_reported_not_passed(tmp_path, sample_api_dir, sample_server, monkeypatch):

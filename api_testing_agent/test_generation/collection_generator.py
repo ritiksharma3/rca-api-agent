@@ -13,6 +13,7 @@ from urllib.parse import quote
 import yaml
 from pydantic import BaseModel, Field
 
+from ..auth.headers import HeaderPlan
 from ..auth.provider import AuthResolution
 from ..errors import CollectionGenerationError, InvalidInputError
 from ..models.endpoint import Endpoint, EndpointInventory, ParamLocation, ValidationStatus
@@ -29,12 +30,81 @@ LOGIN_TIER = 3
 _ID_NAME = re.compile(r"(^|_)id$|[a-z]Id$|^id$", re.I)
 
 
+_API_PREFIX = re.compile(r"^(api|v\d+(\.\d+)*|rest|public|internal|services?)$", re.I)
+_SESSION_END = re.compile(r"log[-_]?out|sign[-_]?out|revoke|invalidate|end[-_]?session|disconnect", re.I)
+_PARAM_SEG = re.compile(r"^\{[^{}]+\}$")
+_ID_KEYS = ("id", "_id", "uuid", "guid", "key", "slug")
+
+
+def resource_of(route: str) -> str:
+    """Folder name for a route: its first segment after generic prefixes such as /api/v1."""
+    segs = [x for x in route.split("/") if x]
+    while len(segs) > 1 and _API_PREFIX.match(segs[0]):
+        segs = segs[1:]
+    return segs[0] if segs and not _PARAM_SEG.match(segs[0]) else "root"
+
+
+def is_session_end(method: str, route: str) -> bool:
+    """Endpoints that invalidate the token the rest of the run is using (logout ...); they must run last."""
+    last = next((x for x in reversed(route.split("/")) if x and not _PARAM_SEG.match(x)), "")
+    return method in ("POST", "DELETE", "GET") and bool(_SESSION_END.search(last))
+
+
+def lifecycle_rank(method: str, route: str) -> int:
+    """create (0) -> list/singleton (1) -> read one (2) -> update (3) -> delete (4): a resource is used in the order it lives."""
+    segs = [x for x in route.split("/") if x]
+    tail_param = bool(segs) and bool(_PARAM_SEG.match(segs[-1]))
+    any_param = any(_PARAM_SEG.match(x) for x in segs)
+    if method == "POST":
+        return 3 if any_param else 0
+    if method in ("GET", "HEAD", "OPTIONS"):
+        return 2 if tail_param else (1 if not any_param else 2)
+    if method == "DELETE":
+        return 4
+    return 3
+
+
+def param_prefix(route: str, name: str) -> str:
+    """The collection route a path parameter belongs to: /api/v1/products/{id} -> /api/v1/products."""
+    i = route.find("{" + name + "}")
+    return route[:i].rstrip("/") if i >= 0 else route
+
+
+def chain_key(prefix: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "_", re.sub(r"\{(\w+)\}", r"\1", prefix)).strip("_") or "root"
+
+
+def capture_script(key: str, param: str, listing: bool) -> list[str]:
+    """Test-script lines that remember a resource id from a response for the requests that need `/{id}` later."""
+    names = list(dict.fromkeys([param, *_ID_KEYS, param.replace("_", "")]))
+    pick = ("function pick(o) { if (!o || typeof o !== 'object') { return null; } "
+            f"var names = {json.dumps(names)}; "
+            "for (var i = 0; i < names.length; i++) { var v = o[names[i]]; if (typeof v === 'string' || typeof v === 'number') { return String(v); } } "
+            "return null; }")
+    if listing:
+        body = [
+            "var arr = Array.isArray(j) ? j : null;",
+            "if (!arr && j && typeof j === 'object') { var ks = ['data', 'items', 'results', 'content', 'records', 'rows'];",
+            "  for (var k = 0; k < ks.length && !arr; k++) { if (Array.isArray(j[ks[k]])) { arr = j[ks[k]]; } }",
+            "  if (!arr) { for (var p in j) { if (Array.isArray(j[p])) { arr = j[p]; break; } } } }",
+            f"if (arr && arr.length && !pm.collectionVariables.get('cur_{key}')) {{ var sid = pick(arr[0]); if (sid) {{ pm.collectionVariables.set('cur_{key}', sid); }} }}",
+        ]
+    else:
+        body = [
+            "var cid = pick(j) || pick(j && j.data) || pick(j && j.result) || pick(j && j.item) || pick(j && j.resource);",
+            f"if (cid) {{ pm.collectionVariables.set('id_{key}', cid); pm.collectionVariables.set('cur_{key}', cid); }}",
+        ]
+    return ["(function () { try {", "  if (pm.response.code < 200 || pm.response.code >= 300) { return; }", "  var j = pm.response.json();",
+            "  " + pick, *["  " + ln for ln in body], "} catch (e) { /* not JSON: nothing to remember */ } })();"]
+
+
 class EndpointFixture(BaseModel):
     path_params: dict[str, Any] = Field(default_factory=dict)
     query: dict[str, Any] = Field(default_factory=dict)
     headers: dict[str, str] = Field(default_factory=dict)
     body: Any = None
     expected_status: list[int] = Field(default_factory=list)
+    generated: bool = False  # body suggested by the agent (LLM), not supplied by the user: free to be made unique per run
 
 
 class Fixtures(BaseModel):
@@ -60,6 +130,7 @@ class GenerationOptions:
     auth: AuthResolution | None = None
     fixtures: Fixtures = field(default_factory=Fixtures)
     seed: int = 1234
+    headers: HeaderPlan | None = None  # headers the target requires on every request (API key, client version, tenant ...)
 
 
 @dataclass
@@ -130,10 +201,19 @@ class _Generator:
         self.data = DataGenerator(opts.seed)
         self.built: list[_Built] = []
         self.blocked: list[BlockedScenario] = []
+        self.created: set[str] = set()  # chain keys whose id a built POST stores in id_<key> / cur_<key>
+        self.listed: set[str] = set()  # chain keys whose first list item a built GET stores in cur_<key>
+        self.consumers: dict[str, str] = {}  # chain key -> path parameter name, for every `/<prefix>/{param}` route
+        for e in inv.endpoints:
+            for n in e.path_param_names:
+                if e.route.rstrip("/").endswith("{" + n + "}"):
+                    self.consumers.setdefault(chain_key(param_prefix(e.route, n)), n)
+        self.creator_routes = {chain_key(e.route) for e in inv.endpoints if e.method == "POST" and not e.path_param_names}
 
     # ---------------------------------------------------------------- per endpoint
     def run(self) -> None:
-        for ep in self.inv.endpoints:
+        # build in lifecycle order so creators (POST /x) exist before the requests that need `/x/{id}`
+        for ep in sorted(self.inv.endpoints, key=lambda e: lifecycle_rank(e.method, e.route)):
             if ep.validation_status == ValidationStatus.INVALID:
                 self._block(ep, Scenario.POSITIVE, "INVALID_INVENTORY_ENTRY", "inventory entry failed validation", True)
                 continue
@@ -164,6 +244,7 @@ class _Generator:
             try:
                 req = self._positive(ep, fx, attach_auth=has_auth and ep.requires_auth is not False)
                 self.built.append(req)
+                self._remember_ids(ep, req)
             except CannotGenerate as exc:
                 self._block(ep, Scenario.POSITIVE, "MISSING_FIXTURE", str(exc), True)
 
@@ -187,6 +268,26 @@ class _Generator:
         elif not self.policy.allow_negative:
             pass  # negative tests not requested: simply not part of the plan
 
+    def _remember_ids(self, ep: Endpoint, built: _Built) -> None:
+        """A POST that creates a resource (or a GET that lists them) stores an id for the `/{id}` requests built after it."""
+        if ep.path_param_names or ep.method not in ("POST", "GET") or is_session_end(ep.method, ep.route):
+            return
+        key = chain_key(ep.route)
+        if key not in self.consumers:
+            return
+        listing = ep.method == "GET"
+        built.item["event"][0]["script"]["exec"] += capture_script(key, self.consumers[key], listing)
+        (self.listed if listing else self.created).add(key)
+
+    def _chained(self, ep: Endpoint, name: str) -> str | None:
+        """`{{var}}` holding the id of a resource this run created (or, for read-only requests, listed); None if none exists."""
+        key = chain_key(param_prefix(ep.route, name))
+        if key in self.created:
+            return "{{id_%s}}" % key if ep.method in ("PUT", "PATCH", "DELETE") else "{{cur_%s}}" % key
+        if key in self.listed and ep.method in ("GET", "HEAD", "OPTIONS"):
+            return "{{cur_%s}}" % key  # existing data is only ever read, never changed or deleted
+        return None
+
     def _login_endpoint(self, ep: Endpoint, fx: EndpointFixture, login: Any, allowed: bool, code: str, why: str) -> None:
         if not allowed:
             self._block(ep, Scenario.POSITIVE, code, why, True)
@@ -204,7 +305,21 @@ class _Generator:
     def _resolve_inputs(self, ep: Endpoint, fx: EndpointFixture) -> tuple[dict[str, Any], list[tuple[str, Any]], dict[str, str]]:
         path_vals: dict[str, Any] = {}
         for p in ep.params(ParamLocation.PATH):
-            path_vals[p.name] = _param_value(self.data, ep, p, fx, self.opts.fixtures, ParamLocation.PATH)
+            try:
+                path_vals[p.name] = _param_value(self.data, ep, p, fx, self.opts.fixtures, ParamLocation.PATH)
+            except CannotGenerate as exc:
+                chained = self._chained(ep, p.name)
+                if chained is None:
+                    prefix = param_prefix(ep.route, p.name)
+                    if chain_key(prefix) in self.creator_routes:
+                        raise CannotGenerate(f"path parameter '{p.name}' needs a resource id; the agent would create one with POST {prefix}, "
+                                             "but that was not possible (needs --allow-mutating, working credentials and a generatable body) "
+                                             "-- or supply the id in the fixtures file") from exc
+                    if ep.method in ("PUT", "PATCH", "DELETE"):
+                        raise CannotGenerate(f"path parameter '{p.name}' needs an existing resource; no POST endpoint to create one was found "
+                                             "and existing data is never modified or deleted -- supply it in the fixtures file") from exc
+                    raise
+                path_vals[p.name] = chained
         query: list[tuple[str, Any]] = []
         for p in ep.params(ParamLocation.QUERY):
             if p.name in fx.query:
@@ -223,15 +338,56 @@ class _Generator:
         if ep.method not in BODY_METHODS or ep.request_body is None:
             return None
         if fx.body is not None:
-            return fx.body
+            return self._protect_account(ep, self._unique(ep, fx.body) if fx.generated else fx.body)
         rb = ep.request_body
         if rb.example is not None:
-            return rb.example
+            return self._protect_account(ep, rb.example)
         if not rb.schema_def:
             if rb.required:
                 raise CannotGenerate("request body is required but its schema is not documented; supply a body in the fixtures file")
             return None
-        return self.data.valid(rb.schema_def, None, required=True)
+        return self._protect_account(ep, self._unique(ep, self.data.valid(rb.schema_def, None, required=True)))
+
+    @staticmethod
+    def _unique(ep: Endpoint, body: Any) -> Any:
+        """Creating the same record twice is rejected (409 "email already registered"), so e-mail addresses in generated
+        POST bodies get a per-request suffix (Postman resolves the dynamic variables when the request is sent)."""
+        if ep.method != "POST":
+            return body
+
+        def walk(node: Any) -> Any:
+            if isinstance(node, dict):
+                return {k: walk(v) for k, v in node.items()}
+            if isinstance(node, list):
+                return [walk(v) for v in node]
+            if isinstance(node, str) and re.fullmatch(r"[^@\s{}]+@[^@\s{}]+\.[A-Za-z]{2,}", node):
+                local, _, domain = node.partition("@")
+                return f"{local.split('+')[0]}+{{{{$timestamp}}}}{{{{$randomInt}}}}@{domain}"
+            return node
+
+        return walk(body)
+
+    def _protect_account(self, ep: Endpoint, body: Any) -> Any:
+        """Never let a test change the credentials the run logs in with (PATCH /users/me {password: "<random>"} would lock the account out).
+
+        In update-style bodies the password / username-like fields carry the account's current values instead, and a refresh-token
+        field carries the real refresh token returned by the login.
+        """
+        if not isinstance(body, dict) or not self.auth or not self.auth.available:
+            return body
+        login, out = self.auth.login, dict(body)
+        register_like = bool(re.search(r"regist|signup|sign-up|create[-_]?account", ep.route, re.I))
+        update_like = login is not None and not register_like and (
+            ep.method in ("PUT", "PATCH") or ep.route.rstrip("/").endswith(("/me", "/profile", "/password", "/change-password")))
+        for k in list(out):
+            if self.auth.refresh_available and re.fullmatch(r"(?i)refresh[-_]?token", k):
+                out[k] = "{{auth_refresh_token}}"
+            elif update_like and login is not None:
+                if re.fullmatch(r"(?i)(current[-_]?|old[-_]?|new[-_]?)?pass(word|wd)?", k) or k == login.password_field:
+                    out[k] = "{{auth_password}}"
+                elif k == login.username_field:
+                    out[k] = "{{auth_username}}"
+        return out
 
     def _positive(self, ep: Endpoint, fx: EndpointFixture, attach_auth: bool, scenario: Scenario = Scenario.POSITIVE,
                   body_override: Any = None, ct_override: str | None = None) -> _Built:
@@ -293,7 +449,7 @@ class _Generator:
               ct_override: str | None = None) -> dict[str, Any]:
         path = ep.route
         for k, v in path_vals.items():
-            path = path.replace("{" + k + "}", quote(str(v), safe=""))
+            path = path.replace("{" + k + "}", str(v) if str(v).startswith("{{") else quote(str(v), safe=""))
         q = list(query)
         hdrs: list[dict[str, str]] = [{"key": "Accept", "value": "application/json"}]
         if attach_auth and self.auth and self.auth.available:
@@ -301,6 +457,9 @@ class _Generator:
                 hdrs.append({"key": self.auth.header_name, "value": self.auth.header_value_template or ""})
             if self.auth.query_name:
                 q.append((self.auth.query_name, self.auth.query_value_template or ""))
+        own = {k.lower() for k in headers}
+        if self.opts.headers:  # headers the target needs on every call (API key, client version, tenant, idempotency key ...)
+            hdrs += [{"key": h.name, "value": h.template} for h in self.opts.headers.headers if h.name.lower() not in own]
         hdrs += [{"key": k, "value": v} for k, v in headers.items()]
         raw_q = "&".join(f"{quote(str(k))}={quote(str(v), safe='{}')}" for k, v in q)
         raw = "{{base_url}}" + path + (("?" + raw_q) if raw_q else "")
@@ -342,16 +501,23 @@ class _Generator:
             plan.blocked.append(BlockedScenario(endpoint_id=b.request.endpoint_id, scenario=b.request.scenario, method=b.request.method,
                                                 route=b.request.route, required=b.request.required, reason_code="REQUEST_BUDGET",
                                                 reason=f"--max-requests={self.policy.max_requests} reached"))
-        folders: dict[str, list[dict[str, Any]]] = {}
-        # The login endpoint's own test runs last: Newman runs folders in order, a fresh login can invalidate the token the
-        # rest of the run uses, and Newman's cookie jar would otherwise attach the new session cookie to the "no credentials" checks.
-        last: list[dict[str, Any]] = []
-        for b in sorted(kept, key=lambda x: (x.request.route, x.request.method, x.request.scenario.value, x.item["id"])):
-            if b.tier == LOGIN_TIER:
-                last.append(b.item)
+        folders: dict[str, list[_Built]] = {}
+        # Newman runs folders and items in order. Within a resource the order is the resource's life: create -> list -> read ->
+        # update -> delete; "without credentials" and negative checks come after the positive flow so they cannot disturb it.
+        # Endpoints that end the session (logout ...) and the login endpoint's own test run last: both can invalidate the token
+        # the rest of the run uses, and Newman's cookie jar would otherwise attach the new session cookie to the "no credentials" checks.
+        last: list[_Built] = []
+        for b in kept:
+            if b.tier == LOGIN_TIER or is_session_end(b.request.method, b.request.route):
+                last.append(b)
                 continue
-            seg = next((s for s in b.request.route.split("/") if s), "root")
-            folders.setdefault(seg, []).append(b.item)
+            folders.setdefault(resource_of(b.request.route), []).append(b)
+
+        def order(b: _Built) -> tuple[Any, ...]:
+            return (b.tier, lifecycle_rank(b.request.method, b.request.route), b.request.route, b.request.method, b.request.scenario.value, b.item["id"])
+
+        last.sort(key=lambda b: (b.tier == LOGIN_TIER, *order(b)))  # logout first (needs the run's token), login test at the very end
+        names = sorted(folders, key=lambda n: (n != "auth", n))
         collection = {
             "info": {
                 "_postman_id": str(uuid.uuid5(uuid.NAMESPACE_URL, "api-testing-agent:" + self.inv.project_root)),
@@ -359,8 +525,8 @@ class _Generator:
                 "description": "Generated by api-testing-agent. Contains no secrets; credentials come from the runtime environment.",
                 "schema": COLLECTION_SCHEMA,
             },
-            "item": [{"name": name, "item": items} for name, items in sorted(folders.items())]
-            + ([{"name": "login endpoint (runs last)", "item": last}] if last else []),
+            "item": [{"name": n, "item": [b.item for b in sorted(folders[n], key=order)]} for n in names]
+            + ([{"name": "session-ending and login endpoints (run last)", "item": [b.item for b in last]}] if last else []),
         }
         env_values = [{"key": "base_url", "value": "", "type": "default", "enabled": True}]
         secret_vars = {
@@ -368,6 +534,9 @@ class _Generator:
             "session": ["auth_cookie", "auth_username", "auth_password"], "basic": ["auth_basic"], "api-key": ["api_key"],
         }.get(self.auth.method if self.auth else "", [])
         env_values += [{"key": k, "value": "", "type": "secret", "enabled": True} for k in secret_vars]
+        if self.opts.headers:
+            env_values += [{"key": h.var, "value": "", "type": "secret" if h.secret else "default", "enabled": True}
+                           for h in self.opts.headers.headers if h.dynamic is None]
         environment = {"id": str(uuid.uuid4()), "name": "api-agent environment template", "values": env_values,
                        "_note": "Variable names only. Real values are injected at run time and never written here."}
         validate_collection(collection)

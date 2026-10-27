@@ -165,12 +165,36 @@ api-agent test ./backend --base-url http://127.0.0.1:8000 --approve-target --aut
    OpenRouter model (`OPENROUTER_MODEL`) to pick the login endpoint. It sends only route/method/field names and a few short, redacted handler
    snippets — **never the username, password or any token — but it does send parts of your source**, so use `--no-llm` for code that must not
    leave the machine. A suggestion is only trusted after a real login with it succeeds; the report records that the LLM was used.
-3. **Log in and extract the token** (common locations such as `access_token`, `token`, `data.token`, or a response header via `--login-token-path header:X-Auth-Token`).
-   Wrong credentials stop immediately (exit 6) instead of being replayed against other endpoints.
+3. **Log in and extract the token.** The response differs between servers (`accessToken`, `access_token`, `data.token`, a nested object, a header ...), so the whole
+   response is searched: a JWT-shaped value wins, then a key named like a token, and refresh tokens are never mistaken for it. `--login-token-path` (or a path saved from an
+   earlier run) is only a *preference*. If nothing is found and the LLM assist is allowed, the model gets the response **shape only** — every value masked as
+   `<str:LENGTH>` — and names the key; the answer is verified against the real response. A `tokenType` such as `Bearer` is honoured, and a returned refresh token
+   is kept for `POST …/refresh`-style endpoints. Wrong credentials stop immediately (exit 6) instead of being replayed against other endpoints; a 401/400
+   that is really a missing header (`INVALID_API_KEY` …) is reported as that, with the server's error code.
 4. **Use it everywhere**: every request that needs auth gets `Authorization: Bearer {{auth_token}}`; the value is injected at run time only.
 5. **Re-login on 401**: requests that were rejected with 401 although a credential was attached are retried **once** with a fresh login
    (the same endpoint that worked). Still-rejected requests are reported with reason `AUTH_REJECTED_AFTER_RELOGIN`.
 6. The detected, non-secret login settings are saved in `<output>/.api-agent.yaml`, so the next run skips detection.
+
+### Required headers, run order and ids
+
+Real APIs usually demand more than a token. The agent handles this in three steps:
+
+1. **Headers.** Header names the backend source reads (`X-API-Key`, `X-Client-Version`, `X-Tenant-ID`, `Idempotency-Key`, `X-Timestamp` … for Express, Flask/FastAPI,
+   Django, Laravel/PHP, Go, Spring, ASP.NET) are detected and sent on **every** request, the login call and the "no credentials" checks included. Values never come from
+   your source. In order: `--header NAME=VALUE` / `--header NAME=env:VAR` → `API_AGENT_HEADER_<NAME>` in `.env` (e.g. `API_AGENT_HEADER_X_API_KEY`; API-key-like names also
+   fall back to `API_AGENT_API_KEY`) → generated per request (idempotency keys and ids → `{{$guid}}`, timestamps → `{{$timestamp}}`) → `1.0.0` for `*-Version` →
+   an LLM-suggested *valid example* (e.g. `tenant-acme`) from the few redacted lines that validate the header, **never for key/token/secret/signature headers**. Anything still
+   missing is listed with the exact `.env` line to add. Headers needing a computed signature (HMAC, digests, nonces) are reported as unsupported. Values travel through the
+   private runtime environment only (`{{hdr_*}}`), never into the collection or reports; the report lists names and provenance.
+2. **Order.** The token is obtained **once, first**, and kept in the private temporary environment file (deleted after the run). The requests then run per resource in
+   its lifetime: create (`POST`) → list → read one → update → delete; then the "without credentials" checks, then negative tests, so a check can never disturb the flow.
+   Session-ending endpoints (`logout`, `signout`, `revoke` …) run **last**, followed by the login endpoint's own test.
+3. **Ids.** A `POST /things` response's id is captured (`pm.collectionVariables`) and used by `GET/PATCH/PUT/DELETE /things/{id}`. If nothing is created, the first item of
+   `GET /things` is used for **read-only** requests; existing records are never updated or deleted — `PATCH/PUT/DELETE` only touch what this run created. A fixtures
+   file still wins over both. Request bodies that static analysis could only guess from field names (`req.body.x`) get a valid example from the LLM (redacted handler source
+   only; needs `--allow-mutating`), e-mail values in generated `POST` bodies are made unique per run, and update bodies carry your current password/username instead of random
+   values so a test can never lock out the account it logs in with.
 
 The login endpoint's own test uses your credentials and runs **last** (a new login can invalidate the token the rest of the run uses, and
 Newman's cookie jar would otherwise leak a session cookie into the "no credentials" checks). The report's *Authentication* section shows the
@@ -281,7 +305,8 @@ tests/            unit/ (no network, no Newman) · integration/ (local sample AP
 * Authentication requirements from static analysis are inferred from dependency/decorator/annotation names only.
 * Request bodies for Express/Flask are inferred from usage (types unknown); Laravel validation rules are not parsed.
 * One global auth method and one account (e.g. a super-admin) per run, so role-restricted behaviour is not compared across roles.
-* No refresh-token flows, MFA/CAPTCHA, or logins that need a CSRF token / multi-step handshake; re-login on 401 is a single retry pass.
+* Ids are chained within one resource (`/things` → `/things/{id}`). A body field that must reference *another* resource (an order's `productId`) is only filled by the LLM's guess (id `1`) or a fixtures file, not from a product the run created. If the 401 re-login retry re-runs a request, ids captured earlier in the run are not available to it.
+* No refresh-token rotation during the run (a returned refresh token is used once, for `…/refresh` endpoints), MFA/CAPTCHA, or logins that need a CSRF token / multi-step handshake; re-login on 401 is a single retry pass.
 * Login detection is heuristic (plus the optional LLM fallback); an unusual login endpoint needs `--login-path`. Detection is verified only against the bundled fixture apps.
 * No multipart bodies.
 * Negative-test expectations (400/422) are inferred unless the spec documents client errors.

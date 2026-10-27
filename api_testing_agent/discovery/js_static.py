@@ -104,6 +104,11 @@ def analyze_express(root: Path, backend_dir: Path, outcome: DiscoveryOutcome) ->
     # (file, var) -> list of (parent (file,var), mount path)
     edges: dict[tuple[str, str], list[tuple[tuple[str, str], str]]] = {}
     routes: list[tuple[_File, str, Any, str, str]] = []  # file, var, call node, verb, path
+    router_auth: dict[tuple[str, str], int] = {}  # (file, var) -> first line of a router-wide auth middleware (`router.use(authenticate)`)
+    mount_auth: set[tuple[str, str]] = set()  # routers mounted behind an auth middleware (`app.use('/x', authenticate, xRouter)`)
+
+    def is_auth(name: str) -> bool:
+        return any(h in name.lower() for h in AUTH_HINTS)
 
     for f in files:
         for n in walk(f.tree.root_node):
@@ -120,6 +125,10 @@ def analyze_express(root: Path, backend_dir: Path, outcome: DiscoveryOutcome) ->
                 continue
             args = _call_args(n)
             if verb == "use":
+                if args and string_value(args[0]) is None and args[0].type != "string":  # router.use(authenticate, ...): applies to routes defined after it
+                    if any(a.type in ("identifier", "member_expression", "call_expression") and is_auth(text(a).split("(")[0]) for a in args):
+                        router_auth[(f.name, var)] = min(router_auth.get((f.name, var), 10**9), line_of(n))
+                    continue
                 if len(args) >= 2:
                     mount = string_value(args[0])
                     child = args[-1]
@@ -147,6 +156,8 @@ def analyze_express(root: Path, backend_dir: Path, outcome: DiscoveryOutcome) ->
                                 target = (tf.name, tvar)
                     if target:
                         edges.setdefault(target, []).append(((f.name, var), mount))
+                        if any(is_auth(text(a).split("(")[0]) for a in args[1:-1]):
+                            mount_auth.add(target)
                     else:
                         outcome.warnings.append(DiscoveryWarning(adapter="express-static", message=f"{var}.use('{mount}', ...) target not resolved statically", source_file=f.name, line=line_of(n)))
                 continue
@@ -170,6 +181,13 @@ def analyze_express(root: Path, backend_dir: Path, outcome: DiscoveryOutcome) ->
                 out.append(join_paths(pp, mount) if (pp or mount) else "")
         return out or [""]
 
+    def behind_auth(key: tuple[str, str], seen: tuple[tuple[str, str], ...] = ()) -> bool:
+        if key in seen:
+            return False
+        if key in mount_auth or key in router_auth:
+            return True
+        return any(behind_auth(parent, seen + (key,)) for parent, _m in edges.get(key, []))
+
     for f, var, call, verb, path in routes:
         key = (f.name, var)
         pfxs = prefixes(key)
@@ -186,7 +204,9 @@ def analyze_express(root: Path, backend_dir: Path, outcome: DiscoveryOutcome) ->
                 body_names += [x.split(":")[0].split("=")[0].strip() for x in m.group(1).split(",") if x.strip()]
             query_names = sorted(set(re.findall(r"req\.query\.(\w+)", htxt)))
             body_names = sorted(set(n for n in body_names if n))
-        requires_auth = True if any(any(h in m.lower() for h in AUTH_HINTS) for m in middlewares) else None
+        router_wide = key in mount_auth or (key in router_auth and router_auth[key] <= line_of(call)) or any(
+            behind_auth(parent) for parent, _m in edges.get(key, []))
+        requires_auth = True if router_wide or any(is_auth(m) for m in middlewares) else None
         methods = ["GET", "POST", "PUT", "PATCH", "DELETE"] if verb == "all" else [verb.upper()]
         for pfx in dict.fromkeys(pfxs):
             full = join_paths(pfx, path) if (pfx or path) else "/"
@@ -209,7 +229,7 @@ def analyze_express(root: Path, backend_dir: Path, outcome: DiscoveryOutcome) ->
                     Endpoint(
                         method=m, route=route, original_path=path, path_param_names=names, parameters=params,
                         request_body=body, requires_auth=requires_auth,
-                        security_schemes=[x for x in middlewares if any(h in x.lower() for h in AUTH_HINTS)],
+                        security_schemes=[x for x in middlewares if is_auth(x)] or (["router-level auth middleware"] if router_wide else []),
                         source_file=f.name, line=line_of(call), handler=text(handler)[:40] if handler is not None and handler.type == "identifier" else None,
                         strategy="static", confidence=Confidence.HIGH if (mounted or f.routers.get(var) == "app") else Confidence.MEDIUM,
                         warnings=warns,
